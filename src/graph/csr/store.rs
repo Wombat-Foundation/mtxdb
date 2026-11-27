@@ -79,22 +79,6 @@ pub const SEAL_THRESHOLD: u64 = 4 * 1024 * 1024;
 
 const RECORD_HEADER: usize = 16 + 2 + 1 + 1 + 4 + 4;
 const EDGE_SIZE: usize = 4 + 2;
-/// Reserved family for the begin (`purge`) and end markers around an atomic
-/// scope rewrite. A plain family id of `u16::MAX` is not otherwise allocated,
-/// and `group_tail` drops the markers instead of storing them as rows.
-const REWRITE_FAMILY: EdgeFamily = EdgeFamily::plain(u16::MAX);
-
-/// Reject the marker family for an ordinary row. Otherwise a caller could write
-/// a row the reader would decode as a rewrite marker and silently drop.
-fn check_row_family(family: EdgeFamily) -> io::Result<()> {
-    if family.id == REWRITE_FAMILY.id {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "csr family id u16::MAX is reserved for rewrite markers",
-        ));
-    }
-    Ok(())
-}
 /// Segment header: magic, version, scope count, record count, payload length.
 const SEGMENT_HEADER: usize = 4 + 1 + 4 + 4 + 4;
 /// One scope index entry: scope, flags, block offset, block length, directory
@@ -141,10 +125,6 @@ pub struct ScopeData {
     /// The scope's rows, in no defined order.
     pub rows: Vec<StoredRow>,
 }
-
-/// Rows saved when a rewrite group opens, restored if the tail stops inside it:
-/// `(begin offset, scope, saved rows, whether the scope was already purged)`.
-type RewriteSnapshot = (u64, [u8; 16], Vec<(RowKey, (bool, Vec<Edge>))>, bool);
 
 /// One pool's shared CSR store.
 #[derive(Debug, Clone)]
@@ -385,9 +365,6 @@ impl CsrStore {
         if rows.is_empty() {
             return Ok(());
         }
-        for row in rows {
-            check_row_family(row.family)?;
-        }
         let created_dir = !self.dir.is_dir();
         fs::create_dir_all(&self.dir)?;
         let created_tail = !self.tail_path().exists();
@@ -479,54 +456,6 @@ impl CsrStore {
         Ok(())
     }
 
-    /// Replace one scope's rows with `rows`, while the caller holds this
-    /// directory's write lock. One tombstone hides every sealed and tail row,
-    /// then the surviving rows are appended after it.
-    ///
-    /// The tombstone and the rows form one atomic group, delimited by
-    /// [`REWRITE_FAMILY`] begin/end markers. A crash that persists only a
-    /// prefix of the group leaves intact frames, so a checksum cannot reject
-    /// it; the reader discards the group instead and keeps the rows the
-    /// tombstone would have hidden.
-    pub(crate) fn rewrite_scope_locked(
-        &self,
-        scope: ScopeId,
-        rows: &[RowRecord],
-    ) -> io::Result<()> {
-        fs::create_dir_all(&self.dir)?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(self.tail_path())?;
-        let valid = self.tail_valid()?;
-        let len = file.metadata()?.len();
-        if valid < len {
-            file.set_len(valid)?;
-        }
-        file.seek(SeekFrom::End(0))?;
-        let mut buffer = Vec::new();
-        write_frame(
-            &mut buffer,
-            &encode_row(scope, REWRITE_FAMILY, 0, &[], true)?,
-        );
-        for row in rows {
-            check_row_family(row.family)?;
-            let payload = encode_row(scope, row.family, row.owner, &row.edges, false)?;
-            write_frame(&mut buffer, &payload);
-        }
-        write_frame(
-            &mut buffer,
-            &encode_row(scope, REWRITE_FAMILY, 0, &[], false)?,
-        );
-        file.write_all(&buffer)?;
-        // The caller syncs once after rewriting every affected scope, but a
-        // repair can add many rows, so still bound the tail like any append.
-        self.maybe_seal()?;
-        Ok(())
-    }
-
     /// Every scope with rows in sealed segments or the verified tail.
     pub(crate) fn all_scopes(&self) -> io::Result<std::collections::BTreeSet<[u8; 16]>> {
         self.with_read_lock(|| {
@@ -560,22 +489,31 @@ impl CsrStore {
 
     /// Seal while the caller holds this directory's write lock.
     fn seal_locked(&self) -> io::Result<()> {
+        self.replace_scopes_locked(&[])
+    }
+
+    /// Seal, replacing each listed scope's rows, while the caller holds this
+    /// directory's write lock. The new segment is published by rename, so a
+    /// crash leaves every listed scope old or every one new. The tail truncate
+    /// is not synced here: a caller replacing rows must sync the tail after.
+    pub(crate) fn replace_scopes_locked(
+        &self,
+        replacements: &[(ScopeId, Vec<RowRecord>)],
+    ) -> io::Result<()> {
         if !self.dir.is_dir() {
             return Ok(());
         }
-        // Never fold a partial rewrite into a segment: `read_tail` below reads
-        // raw frames, so apply the same discard rule the cached reader uses
-        // before grouping them.
-        let valid = self.tail_valid()?;
-        if let Ok(meta) = fs::metadata(self.tail_path()) {
-            if valid < meta.len() {
-                OpenOptions::new()
-                    .write(true)
-                    .open(self.tail_path())?
-                    .set_len(valid)?;
+        let (mut records, valid) = self.read_tail()?;
+        // A tombstone then the survivors, grouped like tail records but never
+        // written to the tail, where a crash could keep only some of them.
+        for (scope, rows) in replacements {
+            let payload = encode_row(*scope, EdgeFamily::plain(0), 0, &[], true)?;
+            records.push(Frame { payload });
+            for row in rows {
+                let payload = encode_row(*scope, row.family, row.owner, &row.edges, false)?;
+                records.push(Frame { payload });
             }
         }
-        let (records, valid) = self.read_tail()?;
         let tail = self.tail_path();
         if records.is_empty() {
             if tail.exists() {
@@ -604,7 +542,9 @@ impl CsrStore {
         fs::rename(&temp, &target)?;
         sync_dir(&self.dir)?;
         // The segment is durable; only now is it safe to drop the tail.
-        OpenOptions::new().write(true).open(&tail)?.set_len(0)?;
+        if tail.exists() {
+            OpenOptions::new().write(true).open(&tail)?.set_len(0)?;
+        }
         Ok(())
     }
 
@@ -926,55 +866,10 @@ impl CsrStore {
                 *count = count.saturating_add(1);
             }
             let (frames, valid) = self.read_tail_from(state.valid)?;
-            // Apply frames in order, tracking an open rewrite group. If the
-            // tail stops inside one, the frames are individually valid but the
-            // group is not, so undo its tombstone and leave `valid` at the
-            // begin marker: the next append truncates the partial rewrite and
-            // the rows it hid are visible again.
-            let mut at = state.valid;
-            let mut open: Option<RewriteSnapshot> = None;
-            let mut kept_valid = state.valid;
             for frame in &frames {
-                let start = at;
-                at = at
-                    .saturating_add(8)
-                    .saturating_add(u64::try_from(frame.payload.len()).unwrap_or(u64::MAX));
-                let (scope, family, _, purge, _) = decode_row(&frame.payload)?;
-                if family.id == REWRITE_FAMILY.id {
-                    if purge {
-                        let saved = state
-                            .rows
-                            .iter()
-                            .filter(|((row_scope, _, _), _)| *row_scope == scope.0)
-                            .map(|(key, value)| (*key, value.clone()))
-                            .collect();
-                        open = Some((start, scope.0, saved, state.purged.contains(&scope.0)));
-                        state.apply(&frame.payload)?;
-                    } else {
-                        open = None;
-                        kept_valid = at;
-                    }
-                    continue;
-                }
                 state.apply(&frame.payload)?;
-                if open.is_none() {
-                    kept_valid = at;
-                }
             }
-            if let Some((start, scope, saved, was_purged)) = open {
-                state
-                    .rows
-                    .retain(|(row_scope, _, _), _| *row_scope != scope);
-                state.rows.extend(saved);
-                if was_purged {
-                    state.purged.insert(scope);
-                } else {
-                    state.purged.remove(&scope);
-                }
-                state.valid = start;
-            } else {
-                state.valid = kept_valid;
-            }
+            state.valid = state.valid.saturating_add(valid as u64);
             TAIL_DECODED_BYTES.fetch_add(valid as u64, Ordering::Relaxed);
             add_nanos(&TAIL_DECODE_NANOS, decoding);
         }
@@ -1054,14 +949,6 @@ fn group_tail(records: &[Frame]) -> io::Result<Vec<([u8; 16], ScopeGroup)>> {
             groups.len().saturating_sub(1)
         });
         let group = &mut groups[slot].1;
-        if family.id == REWRITE_FAMILY.id {
-            if purge {
-                group.rows.clear();
-                group.index.clear();
-                group.purged = true;
-            }
-            continue;
-        }
         if purge {
             group.rows.clear();
             group.index.clear();
@@ -1185,16 +1072,6 @@ struct TailState {
 impl TailState {
     fn apply(&mut self, payload: &[u8]) -> io::Result<()> {
         let (scope, family, owner, purge, edges) = decode_row(payload)?;
-        if family.id == REWRITE_FAMILY.id {
-            // A rewrite marker is not a row. Its begin marker already purged
-            // the scope; the end marker only closes the group.
-            if purge {
-                self.rows
-                    .retain(|(row_scope, _, _), _| *row_scope != scope.0);
-                self.purged.insert(scope.0);
-            }
-            return Ok(());
-        }
         if purge {
             self.rows
                 .retain(|(row_scope, _, _), _| *row_scope != scope.0);
@@ -2046,28 +1923,6 @@ mod tests {
             "a database rooted elsewhere must not authorize this store"
         );
 
-        drop(db);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn rewrite_marker_family_is_reserved_for_internal_frames() {
-        let root = unique_root("rewrite-marker-family");
-        let db = crate::database::Database::open(root.clone()).expect("open database");
-        let store = CsrStore::open(db.layout(), ShardType::State);
-        let error = store
-            .writer(&db)
-            .unwrap()
-            .append_rows(
-                ScopeId([1; 16]),
-                &[RowRecord {
-                    family: EdgeFamily::plain(u16::MAX),
-                    owner: 1,
-                    edges: Vec::new(),
-                }],
-            )
-            .expect_err("the rewrite marker family must not be writable as a row");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         drop(db);
         let _ = fs::remove_dir_all(root);
     }

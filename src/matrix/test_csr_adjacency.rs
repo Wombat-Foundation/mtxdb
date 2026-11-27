@@ -1763,85 +1763,6 @@ mod edge_log_recovery {
         rows
     }
 
-    fn assert_links_preserved(expected: &Links, actual: &Links, context: &str) {
-        for (family, owner, edges) in expected {
-            let Some((_, _, actual_edges)) =
-                actual.iter().find(|(actual_family, actual_owner, _)| {
-                    actual_family == family && actual_owner == owner
-                })
-            else {
-                panic!("{context}: missing row family={family} owner={owner}");
-            };
-            let missing: Vec<_> = edges
-                .iter()
-                .filter(|edge| !actual_edges.contains(edge))
-                .collect();
-            assert!(
-                missing.is_empty(),
-                "{context}: row family={family} owner={owner} lost edges {missing:?}"
-            );
-        }
-    }
-
-    /// Every frame boundary at or after `from`, i.e. each prefix a page
-    /// writeback can leave behind.
-    fn frame_cuts(bytes: &[u8], from: usize) -> Vec<usize> {
-        let mut cuts = Vec::new();
-        let mut at = from;
-        while at.saturating_add(8) <= bytes.len() {
-            let len_at = at.saturating_add(4);
-            let len = u32::from_le_bytes(bytes[at..len_at].try_into().unwrap());
-            let next = at
-                .saturating_add(8)
-                .saturating_add(usize::try_from(len).unwrap());
-            if next > bytes.len() {
-                break;
-            }
-            cuts.push(next);
-            at = next;
-        }
-        cuts
-    }
-
-    /// Reopen from each cut prefix and require every room link to survive,
-    /// with the orphan gone.
-    fn assert_cuts_keep_rows(
-        root: &std::path::Path,
-        tail: &std::path::Path,
-        written: &[u8],
-        cuts: &[usize],
-        scope: ScopeId,
-        expected: &Links,
-        log: &EdgeLog,
-    ) {
-        for (nth, cut) in cuts.iter().copied().enumerate() {
-            std::fs::write(tail, &written[..cut]).unwrap();
-            let db = Database::open(root.to_path_buf()).unwrap();
-            CsrAdjacency::recover_edge_log(&db, log).unwrap();
-            let store = CsrStore::open(db.layout(), ShardType::State);
-            let recovered = scope_links(&store, scope);
-            let missing: Vec<_> = expected
-                .iter()
-                .filter(|row| !recovered.contains(row))
-                .collect();
-            assert!(
-                missing.is_empty(),
-                "cut {nth} at byte {cut} lost {} rows: {missing:?}",
-                missing.len()
-            );
-            assert!(
-                !store
-                    .read_scope(scope)
-                    .unwrap()
-                    .rows
-                    .iter()
-                    .any(|row| row.owner == 99),
-                "the orphan must be gone"
-            );
-            drop(db);
-        }
-    }
-
     /// The crash test's room: a chain with one relation, so prev, auth and
     /// typed relation rows are all covered.
     fn crash_events() -> [EventRecord<'static>; 5] {
@@ -1862,17 +1783,16 @@ mod edge_log_recovery {
         ]
     }
 
-    /// Build the crash fixture: a room with prev, auth and relation links whose
-    /// edge log is pruned, one orphan row that forces a repair, and the rewrite
-    /// bytes a successful repair appends starting at `pre`.
-    fn captured_rewrite(root: &std::path::Path) -> (EdgeLog, ScopeId, Links, Vec<u8>, usize) {
-        let db = Database::open(root.to_path_buf()).unwrap();
+    /// The edge log is pruned before the repair, so the CSR store holds the
+    /// only copy of these links. A crash around the repair must not lose any.
+    #[test]
+    fn a_crash_around_a_repair_keeps_every_link() {
+        let root = test_root("edge-log-repair-crash");
+        let db = Database::open(root.clone()).unwrap();
         let log = EdgeLog::new();
         let adj = CsrAdjacency::for_collection(&ROOM_A);
         adj.record_events_logged(&db, &log, &crash_events(), AppendDurability::Durable)
             .unwrap();
-        // Once the log is pruned, replay cannot restore these rows: the tail is
-        // the only copy left.
         CsrAdjacency::checkpoint_edge_log(&db, &log).unwrap();
         assert_eq!(log.pruned(&db).unwrap(), log.head(&db).unwrap());
 
@@ -1885,86 +1805,45 @@ mod edge_log_recovery {
             .find(|scope| !store.read_scope(*scope).unwrap().rows.is_empty())
             .expect("the room has rows");
         let expected = scope_links(&store, scope);
-        assert!(!expected.is_empty());
-        assert!(
-            expected.iter().any(|(family, _, edges)| {
-                *family == RELATIONS.id && edges.iter().any(|(_, kind)| *kind > 0)
-            }),
-            "the sample must include a typed relation row"
-        );
-
-        // An owner the recovered counter never allocated makes repair rewrite
-        // the whole scope.
+        assert!(expected.iter().any(|(family, _, edges)| {
+            *family == RELATIONS.id && edges.iter().any(|(_, kind)| *kind > 0)
+        }));
+        // An owner the recovered counter never allocated makes repair run.
+        let orphan = RowRecord {
+            family: PREV,
+            owner: 99,
+            edges: Vec::new(),
+        };
         store
             .writer(&db)
             .unwrap()
-            .append_rows(
-                scope,
-                &[RowRecord {
-                    family: PREV,
-                    owner: 99,
-                    edges: Vec::new(),
-                }],
-            )
+            .append_rows(scope, &[orphan])
             .unwrap();
-        let tail = db.layout().graph_path(ShardType::State).join("tail.log");
-        let pre = usize::try_from(std::fs::metadata(&tail).unwrap().len()).unwrap();
-        assert_eq!(CsrAdjacency::recover_edge_log(&db, &log).unwrap(), 0);
-        let written = std::fs::read(&tail).unwrap();
-        assert!(
-            written.len() > pre,
-            "the repair should append a rewrite, not seal it"
+        let dir = db.layout().graph_path(ShardType::State);
+        let tail = dir.join("tail.log");
+        let old_tail = std::fs::read(&tail).unwrap();
+
+        // Crash while writing the new segment: only a partial temp file exists.
+        std::fs::write(dir.join(".partial.tmp"), b"partial").unwrap();
+        let db = restart_keeping_everything(&root, db);
+        CsrAdjacency::recover_edge_log(&db, &log).unwrap();
+        let store = CsrStore::open(db.layout(), ShardType::State);
+        assert_eq!(scope_links(&store, scope), expected);
+        assert_eq!(
+            std::fs::metadata(&tail).unwrap().len(),
+            0,
+            "repair must publish a segment, not rewrite rows in the tail"
         );
+
+        // Crash after the segment is published, with the tail truncate lost:
+        // the old tail overrides the segment until repair runs again.
         drop(db);
-        (log, scope, expected, written, pre)
-    }
-
-    /// A repair rewrites a scope as a tombstone followed by the surviving rows.
-    /// A crash can leave the tombstone and only a prefix of the replacements,
-    /// and every one of those frames is intact, so tail recovery accepts the
-    /// result. The rows the tombstone hid must not stay hidden: the edge log is
-    /// already pruned here, so this file is their only copy.
-    #[test]
-    fn a_crash_inside_a_repair_rewrite_keeps_the_old_rows() {
-        let root = test_root("edge-log-rewrite-crash");
-        let adj = CsrAdjacency::for_collection(&ROOM_A);
-        let (log, scope, expected, written, pre) = captured_rewrite(&root);
-        let tail = root.join("mtgr-state").join("tail.log");
-
-        // The cut just after the begin marker is the worst case: the tombstone
-        // is durable and no replacement row is.
-        let mut cuts = frame_cuts(&written, pre);
-        assert!(
-            cuts.len() > 2,
-            "the rewrite should append several frames, got {cuts:?}"
-        );
-        let worst = cuts[0];
-        // `cuts[1]` is the boundary after the tombstone. Cut inside the first
-        // replacement row, then inside the end marker itself.
-        let first_replacement_start = cuts[1];
-        let end_marker_start = cuts[cuts.len().saturating_sub(2)];
-        cuts.push(first_replacement_start.saturating_add(9));
-        cuts.push(end_marker_start.saturating_add(9));
-        assert_cuts_keep_rows(&root, &tail, &written, &cuts, scope, &expected, &log);
-
-        // A seal must discard the partial group instead of folding it into a
-        // segment, and the rolled-back tail must stay appendable.
-        std::fs::write(&tail, &written[..worst]).unwrap();
-        let db = Database::open(root.clone()).unwrap();
-        CsrStore::open(db.layout(), ShardType::State)
-            .writer(&db)
-            .unwrap()
-            .seal()
-            .unwrap();
-        drop(db);
+        std::fs::write(&tail, &old_tail).unwrap();
         let db = Database::open(root.clone()).unwrap();
         CsrAdjacency::recover_edge_log(&db, &log).unwrap();
         let store = CsrStore::open(db.layout(), ShardType::State);
-        assert_eq!(
-            scope_links(&store, scope),
-            expected,
-            "sealing a partial rewrite must keep the old rows and drop the orphan"
-        );
+        assert_eq!(scope_links(&store, scope), expected);
+
         adj.record_events_logged(
             &db,
             &log,
@@ -1974,96 +1853,25 @@ mod edge_log_recovery {
         .unwrap();
         let db = restart_keeping_everything(&root, db);
         CsrAdjacency::recover_edge_log(&db, &log).unwrap();
+        assert_eq!(adj.prev_of(&db, "$e").unwrap(), Some(vec!["$d".to_owned()]));
+        let d = adj.short_id(&db, "$d").unwrap().unwrap();
+        let e = adj.short_id(&db, "$e").unwrap().unwrap();
         assert!(
-            adj.prev_of(&db, "$e")
+            adj.children_of(&db, d)
                 .unwrap()
-                .is_some_and(|prev| !prev.is_empty()),
-            "an append after a rolled-back rewrite must survive a reopen"
+                .is_some_and(|children| children.contains(&e)),
+            "$d must list the appended event as a child after reopen"
         );
-        drop(db);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn append_after_partial_rewrite_truncates_it_before_reopen() {
-        let root = test_root("edge-log-rewrite-append-crash");
-        let db = Database::open(root.clone()).unwrap();
-        let log = EdgeLog::new();
-        let adj = CsrAdjacency::for_collection(&ROOM_A);
-        adj.record_events_logged(&db, &log, &crash_events(), AppendDurability::Durable)
-            .unwrap();
-        CsrAdjacency::checkpoint_edge_log(&db, &log).unwrap();
-
         let store = CsrStore::open(db.layout(), ShardType::State);
-        let scope = store
-            .all_scopes()
-            .unwrap()
-            .into_iter()
-            .map(ScopeId)
-            .find(|scope| !store.read_scope(*scope).unwrap().rows.is_empty())
-            .expect("the room has CSR rows");
-        let expected = scope_links(&store, scope);
-        store
-            .writer(&db)
-            .unwrap()
-            .append_rows(
-                scope,
-                &[RowRecord {
-                    family: PREV,
-                    owner: 99,
-                    edges: Vec::new(),
-                }],
-            )
-            .unwrap();
-        let tail = db.layout().graph_path(ShardType::State).join("tail.log");
-        let pre = usize::try_from(std::fs::metadata(&tail).unwrap().len()).unwrap();
-        CsrAdjacency::recover_edge_log(&db, &log).unwrap();
-        let written = std::fs::read(&tail).unwrap();
-        let worst = frame_cuts(&written, pre)[0];
-        drop(db);
-
-        // Leave the rewrite's begin marker and tombstone, but no replacements.
-        std::fs::write(&tail, &written[..worst]).unwrap();
-        let db = Database::open(root.clone()).unwrap();
-        // Deliberately append without first calling recovery or seal. The
-        // append path must truncate the incomplete group before adding rows.
-        adj.record_events_logged(
-            &db,
-            &log,
-            &[event("$e", &["$d"])],
-            AppendDurability::Durable,
-        )
-        .unwrap();
-        let after_append = scope_links(&CsrStore::open(db.layout(), ShardType::State), scope);
-        assert_links_preserved(
-            &expected,
-            &after_append,
-            "direct append must leave old links visible before recovery",
-        );
-
-        let db = restart_keeping_everything(&root, db);
-        CsrAdjacency::recover_edge_log(&db, &log).unwrap();
-        let store = CsrStore::open(db.layout(), ShardType::State);
-        let recovered = scope_links(&store, scope);
-        assert_links_preserved(
-            &expected,
-            &recovered,
-            "recovery must preserve every old link",
-        );
-        assert!(
-            !store
-                .read_scope(scope)
-                .unwrap()
-                .rows
-                .iter()
-                .any(|row| row.owner == 99),
-            "recovery must remove the orphan"
-        );
-        assert_eq!(
-            adj.prev_of(&db, "$e").unwrap(),
-            Some(vec!["$d".to_owned()]),
-            "the directly appended event must survive reopen and recovery"
-        );
+        let after = scope_links(&store, scope);
+        for (family, owner, edges) in &expected {
+            assert!(
+                after.iter().any(|(f, o, new)| f == family
+                    && o == owner
+                    && edges.iter().all(|edge| new.contains(edge))),
+                "lost links in row family={family} owner={owner}"
+            );
+        }
         drop(db);
         let _ = std::fs::remove_dir_all(root);
     }
