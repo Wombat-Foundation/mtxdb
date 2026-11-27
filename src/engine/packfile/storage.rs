@@ -3183,6 +3183,28 @@ impl PackfileStorage {
         Ok(store)
     }
 
+    /// Open a read-only worker on one pool of a shared WAL, using explicit
+    /// runtime settings such as paged index residency.
+    ///
+    /// Use this when the writer's index residency is not the default. In
+    /// particular, paged writers require paged readers so WAL coverage reloads
+    /// rebuild the same locator representation.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if opening the read-only store fails, runtime
+    /// settings are invalid, or shared-WAL recovery fails.
+    #[cfg(feature = "multi-reader")]
+    pub fn open_read_committed_shared_with_config(
+        base_dir: PathBuf,
+        wal_path: impl AsRef<Path>,
+        pool: crate::layout::ShardType,
+        config: &RuntimeConfig,
+    ) -> Result<Self, StorageError> {
+        let store = Self::open_read_only_with_config(base_dir, config)?;
+        store.enable_read_journal_shared(wal_path, pool)?;
+        Ok(store)
+    }
+
     /// Open a packfile storage with a custom per-collection cache capacity.
     ///
     /// # Errors
@@ -6102,6 +6124,13 @@ impl PackfileStorage {
         Ok(scanned)
     }
 
+    fn collection_generation_floor(&self, collection_id: &[u8; 16]) -> Option<u32> {
+        self.collection_generation_fences
+            .lock()
+            .get(collection_id)
+            .copied()
+    }
+
     /// Scan every open shard once and build deduplicated record maps for the
     /// requested collections. This is the batch counterpart to `scan_collection_records`:
     /// a shard-compaction preflight must not reread the same packfile once per
@@ -6111,6 +6140,7 @@ impl PackfileStorage {
         collection_ids: &[[u8; 16]],
     ) -> Result<BatchRepackRecordMaps, StorageError> {
         let wanted: HashSet<[u8; 16]> = collection_ids.iter().copied().collect();
+        let generation_fences = self.collection_generation_fences.lock().clone();
         let mut maps: BatchRepackRecordMaps = wanted
             .iter()
             .copied()
@@ -6124,6 +6154,12 @@ impl PackfileStorage {
                 )
             })? {
                 if wanted.contains(&entry.collection_id) {
+                    if generation_fences
+                        .get(&entry.collection_id)
+                        .is_some_and(|floor| shard.creation_seq < *floor)
+                    {
+                        continue;
+                    }
                     let (live, removed) = maps.entry(entry.collection_id).or_default();
                     self.update_repack_record_map(
                         live,
@@ -6391,14 +6427,7 @@ impl PackfileStorage {
     }
 
     fn prepare_recreated_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
-        // Generation fences are only needed when Paged open rebuilds the
-        // locator table from old append-only packs. Resident checkpoints and
-        // delta logs already carry the delete/recreate boundary; rotating its
-        // pack here would invalidate the delta epoch unnecessarily.
-        if self.index_residency != crate::index::IndexResidency::Paged
-            || self.generation(collection_id).is_some()
-            || !self.is_deleted_collection(collection_id)
-        {
+        if self.generation(collection_id).is_some() || !self.is_deleted_collection(collection_id) {
             return Ok(());
         }
         let creation_seq = self
@@ -6408,7 +6437,11 @@ impl PackfileStorage {
         // The fence is durable before store_generation clears the deletion
         // marker. A crash can therefore either keep the collection deleted,
         // or reopen only records from this new physical generation.
-        self.persist_collection_generation_fence(collection_id, creation_seq)
+        self.persist_collection_generation_fence(collection_id, creation_seq)?;
+        // A repack cursor can contain records from the deleted incarnation.
+        // Force its next scan to rebuild under the new durable floor.
+        self.repack_incremental.write().remove(collection_id);
+        Ok(())
     }
 
     fn clear_deleted_collection(&self, collection_id: &[u8; 16]) -> Result<(), StorageError> {
@@ -9309,10 +9342,12 @@ impl PackfileStorage {
     ///
     /// # Errors
     /// Returns `StorageError` on I/O failure scanning a shard.
+    #[allow(clippy::too_many_lines)]
     fn repack_scan_incremental(
         &self,
         collection_id: &[u8; 16],
     ) -> Result<RepackScanResult, StorageError> {
+        let generation_floor = self.collection_generation_floor(collection_id);
         // Check for existing state under a read lock, then move it out under a
         // write lock if present — O(1) ownership transfer, no clone.
         let has_prev = self.repack_incremental.read().contains_key(collection_id);
@@ -9341,6 +9376,13 @@ impl PackfileStorage {
                 let mut map = HashMap::new();
                 let mut removed = HashMap::new();
                 for (slot, entries) in scanned {
+                    if generation_floor.is_some_and(|floor| {
+                        self.shards
+                            .get_shard(slot)
+                            .is_some_and(|shard| shard.creation_seq < floor)
+                    }) {
+                        continue;
+                    }
                     for (hash, offset, is_removed) in entries {
                         self.update_repack_record_map(
                             &mut map,
@@ -9376,7 +9418,9 @@ impl PackfileStorage {
                     })
                     .map_err(StorageError::Io)?;
                 for entry in entries {
-                    if entry.collection_id == *collection_id {
+                    if entry.collection_id == *collection_id
+                        && generation_floor.is_none_or(|floor| shard.creation_seq >= floor)
+                    {
                         self.update_repack_record_map(
                             &mut map,
                             &mut removed,
@@ -9396,6 +9440,13 @@ impl PackfileStorage {
             let mut map = HashMap::new();
             let mut removed = HashMap::new();
             for (slot, entries) in &scanned {
+                if generation_floor.is_some_and(|floor| {
+                    self.shards
+                        .get_shard(*slot)
+                        .is_some_and(|shard| shard.creation_seq < floor)
+                }) {
+                    continue;
+                }
                 for (hash, offset, is_removed) in entries {
                     self.update_repack_record_map(
                         &mut map,
@@ -10393,6 +10444,16 @@ impl PackfileStorage {
         // be missed by the scan or revive an old source after the swap.
         let mutexes: Vec<_> = collection_ids.iter().map(|id| self.put_mutex(id)).collect();
         let collection_guards: Vec<_> = mutexes.iter().map(|mutex| mutex.lock()).collect();
+
+        // A deleted collection's frames are historical. Repacking them would
+        // copy them into a new pack past the tombstone, and a later rebuild
+        // would resurrect records the delete removed. Drop those IDs only after
+        // the put mutexes are held, so a concurrent delete cannot slip between
+        // this check and the scan.
+        collection_ids.retain(|id| !self.is_deleted_collection(id));
+        if collection_ids.is_empty() {
+            return Ok(Vec::new());
+        }
 
         // Same scan visibility requirement as the single-collection repack:
         // every selected collection's buffered frames must be on disk before

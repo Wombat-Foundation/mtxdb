@@ -13385,6 +13385,16 @@ fn paged_delete_recreate_does_not_resurrect_old_records_after_reopen() {
         )
         .unwrap();
     store.sync_all().unwrap();
+
+    // Repack must apply the generation floor while building its direct-scan
+    // candidate map, or it can copy old frames into packs beyond that floor.
+    store
+        .repack_collection_reachable(&TEST_COLLECTION, |_hash, _data| Vec::new())
+        .unwrap();
+    assert!(
+        store.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "single-collection repack must not copy pre-delete records"
+    );
     drop(store);
 
     let reopened = paged_open(&dir);
@@ -13401,6 +13411,386 @@ fn paged_delete_recreate_does_not_resurrect_old_records_after_reopen() {
             .as_ref(),
         b"new generation"
     );
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paged_generation_fence_excludes_old_records_after_delete_marker_is_cleared() {
+    let dir = test_dir("paged_generation_fence_before_first_new_record");
+    let old = distinct_id(1);
+    let new = distinct_id(2);
+
+    let store = paged_open(&dir);
+    store
+        .put(
+            &TEST_COLLECTION,
+            &old,
+            &NodeData::new(bytes::Bytes::from_static(b"old generation")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    store.delete_collection(&TEST_COLLECTION).unwrap();
+
+    // Model a stop after publishing the durable generation fence but before
+    // clearing the deletion marker.
+    store
+        .prepare_recreated_collection(&TEST_COLLECTION)
+        .unwrap();
+    drop(store);
+
+    let reopened = paged_open(&dir);
+    assert!(
+        reopened.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "the delete marker must hide old records while the recreation is incomplete"
+    );
+    // Once the durable fence exists, clearing the marker cannot expose the old
+    // generation, even if the first new-generation append was lost.
+    reopened.clear_deleted_collection(&TEST_COLLECTION).unwrap();
+    drop(reopened);
+
+    let reopened = paged_open(&dir);
+    assert!(
+        reopened.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "the generation fence must exclude old records after the marker is cleared"
+    );
+    reopened
+        .put(
+            &TEST_COLLECTION,
+            &new,
+            &NodeData::new(bytes::Bytes::from_static(b"new generation")),
+        )
+        .unwrap();
+    reopened.sync_all().unwrap();
+    drop(reopened);
+
+    let final_open = paged_open(&dir);
+    assert!(final_open.get(&TEST_COLLECTION, &old).unwrap().is_none());
+    assert_eq!(
+        final_open
+            .get(&TEST_COLLECTION, &new)
+            .unwrap()
+            .unwrap()
+            .bytes
+            .as_ref(),
+        b"new generation"
+    );
+    drop(final_open);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paged_read_only_refresh_loads_new_generation_fence() {
+    let dir = test_dir("paged_read_only_refresh_generation_fence");
+    let old = distinct_id(8);
+    let new = distinct_id(9);
+    let config = crate::config::RuntimeConfig {
+        index_residency: Some(crate::index::IndexResidency::Paged),
+        ..crate::config::RuntimeConfig::default()
+    };
+
+    let writer = paged_open(&dir);
+    writer
+        .put(
+            &TEST_COLLECTION,
+            &old,
+            &NodeData::new(bytes::Bytes::from_static(b"old generation")),
+        )
+        .unwrap();
+    writer.sync_all().unwrap();
+    let reader = PackfileStorage::open_read_only_with_config(dir.clone(), &config).unwrap();
+    assert!(reader.get(&TEST_COLLECTION, &old).unwrap().is_some());
+
+    writer.delete_collection(&TEST_COLLECTION).unwrap();
+    writer
+        .put(
+            &TEST_COLLECTION,
+            &new,
+            &NodeData::new(bytes::Bytes::from_static(b"new generation")),
+        )
+        .unwrap();
+    writer.sync_all().unwrap();
+
+    reader.refresh_collection(&TEST_COLLECTION).unwrap();
+    assert!(
+        reader.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "a read-only worker must load the writer's generation fence before refresh"
+    );
+    assert_eq!(
+        reader
+            .get(&TEST_COLLECTION, &new)
+            .unwrap()
+            .unwrap()
+            .bytes
+            .as_ref(),
+        b"new generation"
+    );
+
+    drop(reader);
+    drop(writer);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn resident_delete_recreate_fence_survives_resident_and_paged_reopen() {
+    let dir = test_dir("resident_delete_recreate_generation_fence");
+    let old = distinct_id(3);
+    let new = distinct_id(4);
+    {
+        let store = PackfileStorage::open(dir.clone()).unwrap();
+        store
+            .put(
+                &TEST_COLLECTION,
+                &old,
+                &NodeData::new(bytes::Bytes::from_static(b"old generation")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+        store.delete_collection(&TEST_COLLECTION).unwrap();
+        store
+            .put(
+                &TEST_COLLECTION,
+                &new,
+                &NodeData::new(bytes::Bytes::from_static(b"new generation")),
+            )
+            .unwrap();
+        store.sync_all().unwrap();
+    }
+
+    let resident = PackfileStorage::open(dir.clone()).unwrap();
+    assert!(
+        resident.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "resident recovery must honor the durable generation fence"
+    );
+    drop(resident);
+    let paged = paged_open(&dir);
+    assert!(
+        paged.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "a resident-written generation must remain fenced in paged mode"
+    );
+    assert!(paged.get(&TEST_COLLECTION, &new).unwrap().is_some());
+    drop(paged);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn batch_repack_does_not_copy_pre_delete_records() {
+    let dir = test_dir("batch_repack_delete_recreate_generation_fence");
+    let old = distinct_id(5);
+    let new = distinct_id(6);
+    let store = paged_open(&dir);
+    store
+        .put(
+            &TEST_COLLECTION,
+            &old,
+            &NodeData::new(bytes::Bytes::from_static(b"old generation")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    store.delete_collection(&TEST_COLLECTION).unwrap();
+    store
+        .put(
+            &TEST_COLLECTION,
+            &new,
+            &NodeData::new(bytes::Bytes::from_static(b"new generation")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+
+    store
+        .repack_collections_reachable(&[TEST_COLLECTION], |_hash, _data| Vec::new())
+        .unwrap();
+    assert!(
+        store.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "batch repack must not copy pre-delete records"
+    );
+    drop(store);
+    let reopened = paged_open(&dir);
+    assert!(reopened.get(&TEST_COLLECTION, &old).unwrap().is_none());
+    assert!(reopened.get(&TEST_COLLECTION, &new).unwrap().is_some());
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A repack scans packfiles directly. It must apply the same generation fence
+/// as an open, or it copies the deleted generation into a newer pack where the
+/// fence no longer excludes it.
+#[test]
+fn paged_repack_does_not_resurrect_deleted_generation() {
+    let dir = test_dir("paged_repack_delete_recreate");
+    let old = distinct_id(1);
+    let new = distinct_id(2);
+
+    let store = paged_open(&dir);
+    store
+        .put(
+            &TEST_COLLECTION,
+            &old,
+            &NodeData::new(bytes::Bytes::from_static(b"old generation")),
+        )
+        .unwrap();
+    // Keep the pack alive after the delete so the old bytes are still
+    // physically scannable; otherwise pack retirement hides the bug.
+    store
+        .put(
+            &OTHER_COLLECTION,
+            &distinct_id(7),
+            &NodeData::new(bytes::Bytes::from_static(b"survivor")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    store.delete_collection(&TEST_COLLECTION).unwrap();
+    store
+        .put(
+            &TEST_COLLECTION,
+            &new,
+            &NodeData::new(bytes::Bytes::from_static(b"new generation")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    assert!(store.get(&TEST_COLLECTION, &old).unwrap().is_none());
+    drop(store);
+
+    // Reopen first: discovery re-adds the retired-but-still-on-disk pack that
+    // holds the deleted generation, which is what a repack would scan.
+    let reopened = paged_open(&dir);
+    assert!(
+        reopened.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "the open-time fence should hide the deleted generation"
+    );
+    // Both physical generations must be visible to the repack scan, or this
+    // test would pass without exercising the fence at all.
+    let pack_files = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "pack"))
+        .count();
+    let scanned: usize = reopened
+        .scan_collection_repack_records(&TEST_COLLECTION)
+        .unwrap()
+        .iter()
+        .map(|(_, entries)| entries.len())
+        .sum();
+    assert_eq!(
+        scanned, 2,
+        "repack scan should see both generations (on-disk packs: {pack_files})"
+    );
+    reopened
+        .repack_collection_reachable(&TEST_COLLECTION, |_, _| Vec::new())
+        .unwrap();
+    reopened.sync_all().unwrap();
+    assert!(
+        reopened.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "repack copied the deleted generation into a newer pack"
+    );
+    drop(reopened);
+
+    let again = paged_open(&dir);
+    assert!(
+        again.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "a recreated collection must not expose pre-delete records after repack"
+    );
+    assert_eq!(
+        again
+            .get(&TEST_COLLECTION, &new)
+            .unwrap()
+            .unwrap()
+            .bytes
+            .as_ref(),
+        b"new generation"
+    );
+    drop(again);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A resident writer's delete/recreate must leave a fence a later paged open
+/// can honor; otherwise switching a room to paged residency resurrects purged
+/// records.
+#[test]
+fn resident_writer_delete_recreate_is_not_resurrected_by_paged_reopen() {
+    let dir = test_dir("resident_write_paged_reopen");
+    let old = distinct_id(3);
+    let new = distinct_id(4);
+
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store
+        .put(
+            &TEST_COLLECTION,
+            &old,
+            &NodeData::new(bytes::Bytes::from_static(b"old generation")),
+        )
+        .unwrap();
+    store
+        .put(
+            &OTHER_COLLECTION,
+            &distinct_id(8),
+            &NodeData::new(bytes::Bytes::from_static(b"survivor")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    store.delete_collection(&TEST_COLLECTION).unwrap();
+    store
+        .put(
+            &TEST_COLLECTION,
+            &new,
+            &NodeData::new(bytes::Bytes::from_static(b"new generation")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    drop(store);
+
+    let reopened = paged_open(&dir);
+    assert!(
+        reopened.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "a paged reopen must honor a fence written by a resident writer"
+    );
+    assert!(reopened.get(&TEST_COLLECTION, &new).unwrap().is_some());
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Resident recovery can fall back to a full pack scan when the checkpoint is
+/// damaged or missing. That scan must also honor the fence.
+#[test]
+fn resident_full_scan_keeps_delete_recreate_fence() {
+    let dir = test_dir("resident_full_scan_fence");
+    let old = distinct_id(5);
+    let new = distinct_id(6);
+
+    let store = PackfileStorage::open(dir.clone()).unwrap();
+    store
+        .put(
+            &TEST_COLLECTION,
+            &old,
+            &NodeData::new(bytes::Bytes::from_static(b"old generation")),
+        )
+        .unwrap();
+    store
+        .put(
+            &OTHER_COLLECTION,
+            &distinct_id(9),
+            &NodeData::new(bytes::Bytes::from_static(b"survivor")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    store.delete_collection(&TEST_COLLECTION).unwrap();
+    store
+        .put(
+            &TEST_COLLECTION,
+            &new,
+            &NodeData::new(bytes::Bytes::from_static(b"new generation")),
+        )
+        .unwrap();
+    store.sync_all().unwrap();
+    drop(store);
+
+    fs::remove_file(PackfileStorage::index_checkpoint_path(&dir)).unwrap();
+    let reopened = PackfileStorage::open(dir.clone()).unwrap();
+    assert!(
+        reopened.get(&TEST_COLLECTION, &old).unwrap().is_none(),
+        "a resident full-scan recovery must not resurrect the deleted generation"
+    );
+    assert!(reopened.get(&TEST_COLLECTION, &new).unwrap().is_some());
     drop(reopened);
     let _ = fs::remove_dir_all(&dir);
 }
@@ -13522,10 +13912,13 @@ fn paged_read_only_worker_reloads_packs_after_shared_wal_reclaim() {
         index_residency: Some(crate::index::IndexResidency::Paged),
         ..crate::RuntimeConfig::default()
     };
-    let reader = PackfileStorage::open_read_only_with_config(dir.clone(), &config).unwrap();
-    reader
-        .enable_read_journal_shared(&wal, ShardType::State)
-        .unwrap();
+    let reader = PackfileStorage::open_read_committed_shared_with_config(
+        dir.clone(),
+        &wal,
+        ShardType::State,
+        &config,
+    )
+    .unwrap();
     assert_eq!(reader.read_covered_lsn.load(Ordering::Acquire), 1);
 
     writer
@@ -16652,4 +17045,98 @@ fn imported_and_quiet_pools_open_beside_a_reclaimed_wal() {
         pool.enable_shared_journal(Arc::clone(&coordinator), ShardType::EventDag)
             .expect("a pool with nothing reclaimed opens without a baseline");
     }
+}
+
+const GENERATION_OLD: [u8; 16] = [0x61; 16];
+const GENERATION_NEW: [u8; 16] = [0x62; 16];
+
+fn put_synced(store: &PackfileStorage, id: &[u8; 16], bytes: &[u8]) {
+    store
+        .put(&TEST_COLLECTION, id, &NodeData::from_slice(bytes))
+        .unwrap();
+    store.sync_all().unwrap();
+}
+
+#[track_caller]
+fn assert_only_new_generation(store: &PackfileStorage, when: &str) {
+    assert!(
+        store
+            .get(&TEST_COLLECTION, &GENERATION_OLD)
+            .unwrap()
+            .is_none(),
+        "{when}: a pre-delete record came back"
+    );
+    assert!(
+        store
+            .get(&TEST_COLLECTION, &GENERATION_NEW)
+            .unwrap()
+            .is_some(),
+        "{when}: the recreated record is missing"
+    );
+}
+
+fn no_edges(_: &[u8; 16], _: &[u8]) -> Vec<[u8; 16]> {
+    Vec::new()
+}
+
+#[test]
+fn resident_recreated_collection_survives_single_repack() {
+    let open = |dir: &std::path::Path| {
+        PackfileStorage::open_with_max_shard_bytes(dir.to_path_buf(), 8192).unwrap()
+    };
+    let dir = test_dir("resident_recreate_single_repack");
+    let store = open(&dir);
+    put_synced(&store, &GENERATION_OLD, b"old generation");
+    store.delete_collection(&TEST_COLLECTION).unwrap();
+    put_synced(&store, &GENERATION_NEW, b"new generation");
+    assert_only_new_generation(&store, "before repack");
+    store
+        .repack_collection_reachable(&TEST_COLLECTION, no_edges)
+        .unwrap();
+    assert_only_new_generation(&store, "after repack");
+    drop(store);
+    assert_only_new_generation(&open(&dir), "after reopen");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A repack leaves an incremental cursor holding its live map. Recreating the
+/// collection must discard it.
+#[test]
+fn recreate_discards_the_incremental_repack_cursor() {
+    let dir = test_dir("recreate_incremental_repack");
+    let store = paged_open(&dir);
+    put_synced(&store, &GENERATION_OLD, b"old generation");
+    store
+        .repack_collection_reachable(&TEST_COLLECTION, no_edges)
+        .unwrap();
+    store.delete_collection(&TEST_COLLECTION).unwrap();
+    put_synced(&store, &GENERATION_NEW, b"new generation");
+    store
+        .repack_collection_reachable(&TEST_COLLECTION, no_edges)
+        .unwrap();
+    assert_only_new_generation(&store, "after second repack");
+    drop(store);
+    assert_only_new_generation(&paged_open(&dir), "after reopen");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn batch_repack_does_not_revive_a_deleted_collection() {
+    let dir = test_dir("deleted_batch_repack");
+    let store = paged_open(&dir);
+    put_synced(&store, &GENERATION_OLD, b"old generation");
+    store.delete_collection(&TEST_COLLECTION).unwrap();
+    store
+        .repack_collections_reachable(&[TEST_COLLECTION], no_edges)
+        .unwrap();
+    assert!(store
+        .get(&TEST_COLLECTION, &GENERATION_OLD)
+        .unwrap()
+        .is_none());
+    drop(store);
+    assert!(paged_open(&dir)
+        .get(&TEST_COLLECTION, &GENERATION_OLD)
+        .unwrap()
+        .is_none());
+    let _ = fs::remove_dir_all(&dir);
 }
