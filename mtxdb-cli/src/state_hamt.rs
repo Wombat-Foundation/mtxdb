@@ -66,6 +66,18 @@ mod tests {
     }
 
     #[test]
+    fn build_rejects_a_repeated_state_key() {
+        let mut input = entries();
+        let (event_type, state_key, _) = input[0].clone();
+        input.push((event_type, state_key, "$other:example.org".to_owned()));
+
+        let error = build_state_hamt("!room:example.org", b"prefix", &input)
+            .err()
+            .unwrap();
+        assert!(error.contains("duplicate state key"), "{error}");
+    }
+
+    #[test]
     fn build_is_deterministic_and_uses_lthash_identity() {
         let input = entries();
         let first = build_state_hamt("!room:example.org", b"prefix", &input).unwrap();
@@ -420,8 +432,7 @@ mod tests {
             baseline
                 .iter()
                 .map(|(kind, key, event)| (state_hamt_leaf_key(kind, key), event.clone())),
-        )
-        .unwrap();
+        );
         let built = build_state_hamt(ROOM, &room_hamt_prefix(ROOM), &baseline).unwrap();
         assert_eq!(base_root.structural_hash, built.root_hash);
         Fixture {

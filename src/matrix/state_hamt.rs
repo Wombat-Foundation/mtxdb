@@ -82,8 +82,9 @@ pub struct BuiltStateHamt {
 /// Leaf keys use rezzy's typed, length-prefixed `(EventType, String)` codec.
 ///
 /// # Errors
-/// Returns a description if `rezzy` cannot build the trie (e.g. a hash
-/// collision below the maximum depth).
+/// Returns a description if two entries share an `(event_type, state_key)`
+/// pair. The state-group digest counts every entry while the trie keeps one per
+/// key, so such input would produce a root record that disagrees with its tree.
 pub fn build_state_hamt(
     room_id: &str,
     room_prefix: &[u8],
@@ -91,15 +92,20 @@ pub fn build_state_hamt(
 ) -> Result<BuiltStateHamt, String> {
     let structural_key = room_structural_key(room_id);
     let mut lattice = LtHash::default();
+    let mut keys = std::collections::HashSet::with_capacity(entries.len());
     for (event_type, state_key, event_id) in entries {
+        if !keys.insert((event_type, state_key)) {
+            return Err(format!(
+                "failed to build state HAMT for {room_id}: duplicate state key ({event_type:?}, {state_key:?})"
+            ));
+        }
         lattice.insert(event_type, state_key, event_id);
     }
 
     let hamt_entries = entries.iter().map(|(event_type, state_key, event_id)| {
         (state_hamt_leaf_key(event_type, state_key), event_id.clone())
     });
-    let root = rezzy::hamt::build_hamt(&structural_key, hamt_entries)
-        .map_err(|error| format!("failed to build state HAMT for {room_id}: {error:?}"))?;
+    let root = rezzy::hamt::build_hamt(&structural_key, hamt_entries);
     let handle = rezzy::hamt::RootHandle::from_lthash(root.structural_hash, &lattice);
 
     let nodes = hamt_store::encode_nodes(&root);
