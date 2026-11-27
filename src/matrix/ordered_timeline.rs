@@ -1,10 +1,15 @@
 //! Matrix event timeline adapters over the protocol-neutral ordered index.
 //!
-//! The two key types intentionally differ: topological paging orders by
-//! `(room, depth, origin_server_ts, stream, ...)`, matching Synapse's
-//! `topological_ordering, origin_server_ts, stream_ordering` pagination order,
-//! while stream paging orders by `(room, stream, depth, origin_server_ts, ...)`.
-//! Their cursors are distinct Rust types and their collections are shared
+//! The two key types are deliberately minimal projections of
+//! [`EventTimelineEntry`]:
+//!
+//! - [`EventTopoKey`] orders by `(room, depth, origin_server_ts, node id)`.
+//! - [`EventStreamKey`] orders by `(room, stream ordering, node id)`.
+//!
+//! A field that belongs only to the other projection is not duplicated in the
+//! key; the node id completes each total order. Callers that need both
+//! positions must keep the domain [`EventTimelineEntry`] or fetch the event.
+//! Their cursors are distinct Rust types, and their collections are shared
 //! across rooms.
 
 use crate::database::DatabaseTransaction;
@@ -16,11 +21,11 @@ use crate::timeline::{OrderedCursor, OrderedIndex, OrderedKey, OrderedPage};
 
 /// Stable logical name shared by both event-order key schemas.
 pub const EVENT_TIMELINE_INDEX_NAME: &str = "event-timeline-v2";
-const EVENT_KEY_WIRE_LEN: usize = 16 + 8 + 8 + 8 + 16;
-type DecodedEventKey = ([u8; 16], [i64; 3], NodeId);
+const EVENT_TOPO_KEY_WIRE_LEN: usize = 16 + 8 + 8 + 16;
+const EVENT_STREAM_KEY_WIRE_LEN: usize = 16 + 8 + 16;
 type TimelineMutationRoots = ((NodeId, u64), (NodeId, u64));
-const EVENT_TOPO_SCHEMA: [u8; 4] = *b"ETP2";
-const EVENT_STREAM_SCHEMA: [u8; 4] = *b"ESR2";
+const EVENT_TOPO_SCHEMA: [u8; 4] = *b"ETP3";
+const EVENT_STREAM_SCHEMA: [u8; 4] = *b"ESR3";
 const MIN_NODE_ID: NodeId = [0; 16];
 const MAX_NODE_ID: NodeId = [0xff; 16];
 
@@ -66,7 +71,6 @@ impl EventTimelineEntry {
             room_scope: self.room_scope,
             topological_ordering: self.topological_ordering,
             origin_server_ts: self.origin_server_ts,
-            stream_ordering: self.stream_ordering,
             event_node_id: self.event_node_id,
         }
     }
@@ -77,14 +81,12 @@ impl EventTimelineEntry {
         EventStreamKey {
             room_scope: self.room_scope,
             stream_ordering: self.stream_ordering,
-            topological_ordering: self.topological_ordering,
-            origin_server_ts: self.origin_server_ts,
             event_node_id: self.event_node_id,
         }
     }
 }
 
-/// `(room, topological ordering, origin_server_ts, stream ordering, node id)` key.
+/// `(room, topological ordering, origin_server_ts, node id)` key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EventTopoKey {
     /// Leading room scope.
@@ -93,56 +95,38 @@ pub struct EventTopoKey {
     pub topological_ordering: i64,
     /// `origin_server_ts`, `0` when absent.
     pub origin_server_ts: i64,
-    /// Stream ordering.
-    pub stream_ordering: i64,
     /// Event record node id.
     pub event_node_id: NodeId,
 }
 
 impl EventTopoKey {
-    /// The timeline entry this key was projected from.
-    #[must_use]
-    pub const fn entry(self) -> EventTimelineEntry {
-        EventTimelineEntry::new(
-            self.room_scope,
-            self.topological_ordering,
-            self.origin_server_ts,
-            self.stream_ordering,
-            self.event_node_id,
-        )
-    }
-
-    /// The greatest key at a `(topological, origin_server_ts, stream)`
-    /// position. Every key at or before that position sorts at or below it.
+    /// The greatest key at a `(topological, origin_server_ts)` position. Every
+    /// key at or before that position sorts at or below it.
     #[must_use]
     pub const fn position_max(
         room_scope: [u8; 16],
         topological_ordering: i64,
         origin_server_ts: i64,
-        stream_ordering: i64,
     ) -> Self {
         Self {
             room_scope,
             topological_ordering,
             origin_server_ts,
-            stream_ordering,
             event_node_id: MAX_NODE_ID,
         }
     }
 
-    /// The least key at a `(topological, origin_server_ts, stream)` position.
+    /// The least key at a `(topological, origin_server_ts)` position.
     #[must_use]
     pub const fn position_min(
         room_scope: [u8; 16],
         topological_ordering: i64,
         origin_server_ts: i64,
-        stream_ordering: i64,
     ) -> Self {
         Self {
             room_scope,
             topological_ordering,
             origin_server_ts,
-            stream_ordering,
             event_node_id: MIN_NODE_ID,
         }
     }
@@ -151,7 +135,7 @@ impl EventTopoKey {
 impl OrderedKey for EventTopoKey {
     type Prefix = [u8; 16];
 
-    const WIRE_LEN: usize = EVENT_KEY_WIRE_LEN;
+    const WIRE_LEN: usize = EVENT_TOPO_KEY_WIRE_LEN;
     const SCHEMA_TAG: [u8; 4] = EVENT_TOPO_SCHEMA;
 
     fn prefix(&self) -> Self::Prefix {
@@ -159,68 +143,49 @@ impl OrderedKey for EventTopoKey {
     }
 
     fn encode_into(&self, out: &mut Vec<u8>) {
-        encode_event_key(
-            out,
-            self.room_scope,
-            [
-                self.topological_ordering,
-                self.origin_server_ts,
-                self.stream_ordering,
-            ],
-            self.event_node_id,
-        );
+        out.extend_from_slice(&self.room_scope);
+        out.extend_from_slice(&encode_i64(self.topological_ordering));
+        out.extend_from_slice(&encode_i64(self.origin_server_ts));
+        out.extend_from_slice(&self.event_node_id);
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
-        let (room_scope, [topological_ordering, origin_server_ts, stream_ordering], event_node_id) =
-            decode_event_key(bytes)?;
+        if bytes.len() != EVENT_TOPO_KEY_WIRE_LEN {
+            return Err(StorageError::Corrupt("event topo key length".to_owned()));
+        }
+        let mut room_scope = [0; 16];
+        room_scope.copy_from_slice(&bytes[..16]);
+        let topological_ordering = decode_i64(&bytes[16..24])?;
+        let origin_server_ts = decode_i64(&bytes[24..32])?;
+        let mut event_node_id = [0; 16];
+        event_node_id.copy_from_slice(&bytes[32..48]);
         Ok(Self {
             room_scope,
             topological_ordering,
             origin_server_ts,
-            stream_ordering,
             event_node_id,
         })
     }
 }
 
-/// `(room, stream ordering, topological ordering, origin_server_ts, node id)` key.
+/// `(room, stream ordering, node id)` key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EventStreamKey {
     /// Leading room scope.
     pub room_scope: [u8; 16],
-    /// Stream ordering precedes depth in this key's ordering.
+    /// Stream ordering within the room.
     pub stream_ordering: i64,
-    /// Topological ordering.
-    pub topological_ordering: i64,
-    /// `origin_server_ts`, `0` when absent. Carried so a stream page can
-    /// build topological tokens without fetching event bodies.
-    pub origin_server_ts: i64,
     /// Event record node id.
     pub event_node_id: NodeId,
 }
 
 impl EventStreamKey {
-    /// The timeline entry this key was projected from.
-    #[must_use]
-    pub const fn entry(self) -> EventTimelineEntry {
-        EventTimelineEntry::new(
-            self.room_scope,
-            self.topological_ordering,
-            self.origin_server_ts,
-            self.stream_ordering,
-            self.event_node_id,
-        )
-    }
-
     /// The greatest key at a stream position.
     #[must_use]
     pub const fn position_max(room_scope: [u8; 16], stream_ordering: i64) -> Self {
         Self {
             room_scope,
             stream_ordering,
-            topological_ordering: i64::MAX,
-            origin_server_ts: i64::MAX,
             event_node_id: MAX_NODE_ID,
         }
     }
@@ -231,8 +196,6 @@ impl EventStreamKey {
         Self {
             room_scope,
             stream_ordering,
-            topological_ordering: i64::MIN,
-            origin_server_ts: i64::MIN,
             event_node_id: MIN_NODE_ID,
         }
     }
@@ -241,7 +204,7 @@ impl EventStreamKey {
 impl OrderedKey for EventStreamKey {
     type Prefix = [u8; 16];
 
-    const WIRE_LEN: usize = EVENT_KEY_WIRE_LEN;
+    const WIRE_LEN: usize = EVENT_STREAM_KEY_WIRE_LEN;
     const SCHEMA_TAG: [u8; 4] = EVENT_STREAM_SCHEMA;
 
     fn prefix(&self) -> Self::Prefix {
@@ -249,26 +212,23 @@ impl OrderedKey for EventStreamKey {
     }
 
     fn encode_into(&self, out: &mut Vec<u8>) {
-        encode_event_key(
-            out,
-            self.room_scope,
-            [
-                self.stream_ordering,
-                self.topological_ordering,
-                self.origin_server_ts,
-            ],
-            self.event_node_id,
-        );
+        out.extend_from_slice(&self.room_scope);
+        out.extend_from_slice(&encode_i64(self.stream_ordering));
+        out.extend_from_slice(&self.event_node_id);
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
-        let (room_scope, [stream_ordering, topological_ordering, origin_server_ts], event_node_id) =
-            decode_event_key(bytes)?;
+        if bytes.len() != EVENT_STREAM_KEY_WIRE_LEN {
+            return Err(StorageError::Corrupt("event stream key length".to_owned()));
+        }
+        let mut room_scope = [0; 16];
+        room_scope.copy_from_slice(&bytes[..16]);
+        let stream_ordering = decode_i64(&bytes[16..24])?;
+        let mut event_node_id = [0; 16];
+        event_node_id.copy_from_slice(&bytes[24..40]);
         Ok(Self {
             room_scope,
             stream_ordering,
-            topological_ordering,
-            origin_server_ts,
             event_node_id,
         })
     }
@@ -675,35 +635,6 @@ impl StorageEngine for ReadCommittedEngine<'_> {
 
 fn max_stream_key(room_scope: [u8; 16], persisted_up_to: i64) -> EventStreamKey {
     EventStreamKey::position_max(room_scope, persisted_up_to)
-}
-
-fn encode_event_key(
-    out: &mut Vec<u8>,
-    room_scope: [u8; 16],
-    positions: [i64; 3],
-    event_node_id: NodeId,
-) {
-    out.extend_from_slice(&room_scope);
-    for position in positions {
-        out.extend_from_slice(&encode_i64(position));
-    }
-    out.extend_from_slice(&event_node_id);
-}
-
-fn decode_event_key(bytes: &[u8]) -> Result<DecodedEventKey, StorageError> {
-    if bytes.len() != EVENT_KEY_WIRE_LEN {
-        return Err(StorageError::Corrupt("event ordered key length".to_owned()));
-    }
-    let mut room_scope = [0; 16];
-    room_scope.copy_from_slice(&bytes[..16]);
-    let positions = [
-        decode_i64(&bytes[16..24])?,
-        decode_i64(&bytes[24..32])?,
-        decode_i64(&bytes[32..40])?,
-    ];
-    let mut event_node_id = [0; 16];
-    event_node_id.copy_from_slice(&bytes[40..56]);
-    Ok((room_scope, positions, event_node_id))
 }
 
 fn encode_i64(value: i64) -> [u8; 8] {

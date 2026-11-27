@@ -21,8 +21,8 @@ fn event(room: [u8; 16], depth: i64, stream: i64, id: u8) -> EventTimelineEntry 
 
 #[test]
 fn event_key_orders_match_their_memcomparable_encodings() {
-    assert_eq!(EventTopoKey::WIRE_LEN, 56);
-    assert_eq!(EventStreamKey::WIRE_LEN, 56);
+    assert_eq!(EventTopoKey::WIRE_LEN, 48);
+    assert_eq!(EventStreamKey::WIRE_LEN, 40);
     let entries = [
         event([1; 16], -4, 11, 1),
         event([1; 16], -4, -2, 2),
@@ -66,8 +66,8 @@ fn timed(room: [u8; 16], depth: i64, ts: i64, stream: i64, id: u8) -> EventTimel
 }
 
 #[test]
-fn equal_depth_events_order_by_timestamp_before_stream() {
-    // Synapse orders topological pages by (depth, origin_server_ts, stream).
+fn equal_depth_events_order_by_timestamp() {
+    // The topological key orders by (depth, origin_server_ts, node id).
     let room = [3; 16];
     let late_arrival_early_ts = timed(room, 5, 100, 9, 1);
     let early_arrival_late_ts = timed(room, 5, 200, 2, 2);
@@ -77,10 +77,13 @@ fn equal_depth_events_order_by_timestamp_before_stream() {
         let mut wire = Vec::new();
         entry.topo_key().encode_into(&mut wire);
         let decoded = EventTopoKey::decode(&wire).unwrap();
-        assert_eq!(decoded.entry(), entry);
+        assert_eq!(decoded, entry.topo_key());
         wire.clear();
         entry.stream_key().encode_into(&mut wire);
-        assert_eq!(EventStreamKey::decode(&wire).unwrap().entry(), entry);
+        let decoded = EventStreamKey::decode(&wire).unwrap();
+        assert_eq!(decoded.room_scope, entry.room_scope);
+        assert_eq!(decoded.stream_ordering, entry.stream_ordering);
+        assert_eq!(decoded.event_node_id, entry.event_node_id);
     }
     let mut wires: Vec<Vec<u8>> = [late_arrival_early_ts, early_arrival_late_ts]
         .iter()
@@ -94,9 +97,9 @@ fn equal_depth_events_order_by_timestamp_before_stream() {
     wires.sort();
     assert_eq!(wires, sorted);
 
-    let position = EventTopoKey::position_max(room, 5, 100, 9);
+    let position = EventTopoKey::position_max(room, 5, 100);
     assert!(late_arrival_early_ts.topo_key() <= position);
-    assert!(EventTopoKey::position_min(room, 5, 100, 9) <= late_arrival_early_ts.topo_key());
+    assert!(EventTopoKey::position_min(room, 5, 100) <= late_arrival_early_ts.topo_key());
     assert!(EventStreamKey::position_min(room, 9) <= late_arrival_early_ts.stream_key());
     assert!(late_arrival_early_ts.stream_key() <= EventStreamKey::position_max(room, 9));
 }
@@ -584,7 +587,7 @@ fn remove_and_purge_keep_both_orders_consistent() {
         topo_page
             .entries
             .iter()
-            .map(|entry| entry.stream_ordering)
+            .map(|entry| entry.topological_ordering)
             .collect::<Vec<_>>(),
         [1, 3]
     );
