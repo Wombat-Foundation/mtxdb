@@ -962,9 +962,13 @@ impl Database {
 
     /// Open with explicit policies and runtime settings.
     ///
-    /// A `Some` index residency in `config` overrides every pool's policy.
-    /// Paged residency is rejected before any I/O because shared-WAL
-    /// journaling cannot advance durable coverage from a paged sync.
+    /// A `Some` index residency in `config` overrides every pool's policy,
+    /// including paged. A paged pool advances durable coverage from its
+    /// sidecar sync, so a read-only worker sharing that pool's WAL must open
+    /// with the same residency (see
+    /// `PackfileStorage::open_read_committed_shared_with_config`, available
+    /// with the `multi-reader` feature); the plain shared reader opens
+    /// resident and cannot reload a paged writer's reclaimed WAL.
     ///
     /// # Errors
     /// Returns an error for an invalid config, unsupported residency, if the
