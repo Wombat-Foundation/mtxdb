@@ -1,4 +1,4 @@
-//! Storage-facing index over [`super::bucket::RawBucketTable`].
+//! Storage-facing index over [`super::table::RawBucketTable`].
 //!
 //! The table stores only a seeded fingerprint and locator. Full identity is
 //! checked against the authoritative frame header at the storage boundary.
@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use super::bucket::{BucketCandidate, BucketSnapshotError, BucketUndo, RawBucketTable};
+use super::table::{BucketCandidate, BucketSnapshotError, BucketUndo, RawBucketTable};
 use super::{IndexConfig, InsertError};
 
 /// Per-collection candidate index backed by cache-line buckets.

@@ -26,7 +26,7 @@
 
 use crate::packfile::PackId;
 
-use super::bucket_index::BucketIndex;
+use super::collection::BucketIndex;
 
 /// Encoded length of one record.
 pub const REDO_RECORD_LEN: usize = 80;

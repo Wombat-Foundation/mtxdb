@@ -37,12 +37,12 @@ use std::sync::Arc;
 
 use memmap2::Mmap;
 
-use super::bucket::RawBucketTable;
 use super::format::{
     CheckpointHeader, CollectionDirEntry, CollectionVersionEntry, PackTableEntry,
     CHECKPOINT_HEADER_LEN, COLLECTION_DIR_ENTRY_LEN, COLLECTION_VERSION_ENTRY_LEN,
     PACK_TABLE_ENTRY_LEN,
 };
+use super::table::RawBucketTable;
 use crate::packfile::PackId;
 
 /// Magic identifying the persisted-index checkpoint format.

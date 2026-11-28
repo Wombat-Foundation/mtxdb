@@ -1,14 +1,14 @@
 //! Per-collection bucket indexes and their persistence formats.
 
-pub mod bucket;
-pub mod bucket_index;
 pub mod checkpoint;
+pub mod collection;
 pub mod delta;
 pub mod format;
 pub mod redo;
+pub mod table;
 pub mod versions;
 
-pub use bucket_index::BucketIndex;
+pub use collection::BucketIndex;
 
 /// Per-database tuning for bucket-index construction.
 #[derive(Debug, Clone, Copy)]

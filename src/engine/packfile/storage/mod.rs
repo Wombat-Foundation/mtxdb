@@ -9,8 +9,6 @@ use arc_swap::ArcSwap;
 use parking_lot::{MutexGuard, RwLock};
 
 use crate::cache::{NodeCache, PinnedNodes};
-use crate::index::bucket::BucketCandidate;
-use crate::index::bucket::BucketUndo;
 #[cfg(test)]
 use crate::index::checkpoint::CheckpointWrite;
 use crate::index::checkpoint::PreparedCheckpoint;
@@ -18,6 +16,8 @@ use crate::index::delta::{self, DeltaOperation, INDEX_DELTA_FILE};
 #[cfg(test)]
 use crate::index::redo::RedoOp;
 use crate::index::redo::RedoRecord;
+use crate::index::table::BucketCandidate;
+use crate::index::table::BucketUndo;
 use crate::index::{BucketIndex, InsertError};
 use crate::journal::pool_tag;
 use crate::journal::{
