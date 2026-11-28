@@ -9141,7 +9141,7 @@ fn a_room_export_without_a_create_event_is_refused() {
 #[test]
 fn a_room_import_populates_timeline_index() {
     use crate::interchange::parse_room;
-    use mtxdb::ordered_timeline::EventTopoIndex;
+    use mtxdb::event_timeline::EventTopoIndex;
     use mtxdb::room_scope_id;
     use mtxdb::ShardType;
 
@@ -9156,7 +9156,7 @@ fn a_room_import_populates_timeline_index() {
     let room_scope = room_scope_id(FIXTURE_ROOM.as_bytes());
     let timeline_index = EventTopoIndex::open(
         db.pool(ShardType::EventDag).as_ref(),
-        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+        mtxdb::event_timeline::EVENT_TIMELINE_INDEX_NAME,
     );
     let page = timeline_index.page(&room_scope, None, true, 10).unwrap();
     assert_eq!(page.entries.len(), 6);
@@ -9363,9 +9363,9 @@ fn stale_auth_events_are_rejected_against_state_before() {
         3
     );
 
-    let page = mtxdb::ordered_timeline::EventStreamIndex::open(
+    let page = mtxdb::event_timeline::EventStreamIndex::open(
         db.pool(ShardType::EventDag).as_ref(),
-        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+        mtxdb::event_timeline::EVENT_TIMELINE_INDEX_NAME,
     )
     .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
     .unwrap();
@@ -9450,9 +9450,9 @@ fn rejected_state_event_does_not_change_later_state() {
         4
     );
 
-    let page = mtxdb::ordered_timeline::EventStreamIndex::open(
+    let page = mtxdb::event_timeline::EventStreamIndex::open(
         db.pool(ShardType::EventDag).as_ref(),
-        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+        mtxdb::event_timeline::EVENT_TIMELINE_INDEX_NAME,
     )
     .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
     .unwrap();
@@ -9547,9 +9547,9 @@ fn partial_base_state_is_left_unchecked() {
         5
     );
 
-    let page = mtxdb::ordered_timeline::EventStreamIndex::open(
+    let page = mtxdb::event_timeline::EventStreamIndex::open(
         db.pool(ShardType::EventDag).as_ref(),
-        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+        mtxdb::event_timeline::EVENT_TIMELINE_INDEX_NAME,
     )
     .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
     .unwrap();
@@ -9726,7 +9726,7 @@ fn exported_rejected_flag_is_not_trusted_for_state() {
 #[test]
 fn flag_index_timeline_count_matches_timeline_index() {
     use crate::interchange::parse_room;
-    use mtxdb::ordered_timeline::EventTopoIndex;
+    use mtxdb::event_timeline::EventTopoIndex;
     use mtxdb::room_flag::*;
     use mtxdb::room_scope_id;
     use mtxdb::ShardType;
@@ -9762,7 +9762,7 @@ fn flag_index_timeline_count_matches_timeline_index() {
     let room_scope = room_scope_id(room_id.as_bytes());
     let timeline_index = EventTopoIndex::open(
         db.pool(ShardType::EventDag).as_ref(),
-        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+        mtxdb::event_timeline::EVENT_TIMELINE_INDEX_NAME,
     );
     let page = timeline_index.page(&room_scope, None, true, 100).unwrap();
 
@@ -9816,9 +9816,9 @@ fn legacy_export_soft_failed_outlier_stays_out_of_timeline() {
     assert_eq!(written.events, 4);
 
     let room_scope = room_scope_id(room_id.as_bytes());
-    let timeline_index = mtxdb::ordered_timeline::EventStreamIndex::open(
+    let timeline_index = mtxdb::event_timeline::EventStreamIndex::open(
         db.pool(ShardType::EventDag).as_ref(),
-        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+        mtxdb::event_timeline::EVENT_TIMELINE_INDEX_NAME,
     );
     let page = timeline_index.page(&room_scope, None, true, 100).unwrap();
 
@@ -9852,8 +9852,8 @@ fn legacy_export_soft_failed_outlier_stays_out_of_timeline() {
 #[test]
 fn stream_and_arrival_order_survive_import() {
     use crate::interchange::parse_room;
+    use mtxdb::event_timeline::EventTopoIndex;
     use mtxdb::interop::*;
-    use mtxdb::ordered_timeline::EventTopoIndex;
     use mtxdb::room_flag::*;
     use mtxdb::room_scope_id;
     use mtxdb::ShardType;
@@ -9892,15 +9892,15 @@ fn stream_and_arrival_order_survive_import() {
     let room_scope = room_scope_id(room_id.as_bytes());
     let timeline_index = EventTopoIndex::open(
         db.pool(ShardType::EventDag).as_ref(),
-        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+        mtxdb::event_timeline::EVENT_TIMELINE_INDEX_NAME,
     );
     let page = timeline_index.page(&room_scope, None, true, 100).unwrap();
 
     // Live and backfilled positions are preserved exactly; the soft-failed
     // event has no timeline position and stays out.
-    let stream_page = mtxdb::ordered_timeline::EventStreamIndex::open(
+    let stream_page = mtxdb::event_timeline::EventStreamIndex::open(
         db.pool(ShardType::EventDag).as_ref(),
-        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+        mtxdb::event_timeline::EVENT_TIMELINE_INDEX_NAME,
     )
     .page(&room_scope, None, true, 100)
     .unwrap();
@@ -10009,9 +10009,9 @@ fn imported_soft_fail_is_queryable_and_stays_out_of_timeline() {
         "--flag soft-failed selects the imported event"
     );
 
-    let page = mtxdb::ordered_timeline::EventStreamIndex::open(
+    let page = mtxdb::event_timeline::EventStreamIndex::open(
         db.pool(ShardType::EventDag).as_ref(),
-        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+        mtxdb::event_timeline::EVENT_TIMELINE_INDEX_NAME,
     )
     .page(&room_scope_id(room_id.as_bytes()), None, true, 100)
     .unwrap();
@@ -10142,7 +10142,7 @@ fn rebuild_fidelity_reproduces_exact_bitmaps_after_wipe() {
 #[test]
 fn timeline_ordering_respects_depth_signed_stream_and_timeline_flag() {
     use crate::interchange::parse_room;
-    use mtxdb::ordered_timeline::EventTopoIndex;
+    use mtxdb::event_timeline::EventTopoIndex;
     use mtxdb::room_scope_id;
     use mtxdb::ShardType;
 
@@ -10182,7 +10182,7 @@ fn timeline_ordering_respects_depth_signed_stream_and_timeline_flag() {
     let room_scope = room_scope_id(room_id.as_bytes());
     let timeline_index = EventTopoIndex::open(
         db.pool(ShardType::EventDag).as_ref(),
-        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+        mtxdb::event_timeline::EVENT_TIMELINE_INDEX_NAME,
     );
     let page = timeline_index.page(&room_scope, None, true, 10).unwrap();
 
@@ -10207,9 +10207,9 @@ fn timeline_ordering_respects_depth_signed_stream_and_timeline_flag() {
     assert_eq!(page.entries[3].origin_server_ts, 3000);
 
     // The stream index keeps the signed positions, in stream order.
-    let stream_page = mtxdb::ordered_timeline::EventStreamIndex::open(
+    let stream_page = mtxdb::event_timeline::EventStreamIndex::open(
         db.pool(ShardType::EventDag).as_ref(),
-        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+        mtxdb::event_timeline::EVENT_TIMELINE_INDEX_NAME,
     )
     .page(&room_scope, None, true, 10)
     .unwrap();

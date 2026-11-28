@@ -5,14 +5,14 @@ mod tests {
 
     use crate::csr_adjacency::CsrAdjacency;
     use crate::database::{Database, DatabaseTransaction};
+    use crate::event_timeline::{
+        open_event_timeline_indexes, stage_event_timeline_batch, EventTimelineEntry,
+    };
     use crate::interop::{
         decode_verdict, encode_verdict, event_record_id, event_verdict_collection_id,
         room_event_collection_id, room_flag_collection_id, Verdict,
     };
     use crate::layout::ShardType;
-    use crate::ordered_timeline::{
-        open_event_timeline_indexes, stage_event_timeline_batch, EventTimelineEntry,
-    };
     use crate::room_flag::{
         flag_chunk_node_id, Flag, FlagChange, FlagQuery, RebuildInputs, RoomFlagIndex,
         CHUNK_CAPACITY, FLAG_META_ID,

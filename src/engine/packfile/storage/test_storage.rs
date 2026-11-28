@@ -2648,7 +2648,7 @@ fn header_only_shard_collections() -> Vec<u8> {
     buf.extend_from_slice(&1_u64.to_le_bytes());
     buf.extend_from_slice(&[0u8; 4]);
     let crc = crc32fast::hash(&buf);
-    buf[SHARD_ROOMS_CRC_OFFSET..SHARD_ROOMS_HEADER_LEN].copy_from_slice(&crc.to_le_bytes());
+    buf[SHARD_ROOMS_CRC_OFFSET..SHARD_COLLECTIONS_HEADER_LEN].copy_from_slice(&crc.to_le_bytes());
     buf
 }
 
@@ -2703,9 +2703,12 @@ fn shard_collections_checksum_rejects_damage_and_rebuilds_accounting() {
     variants.push(("crc", crc));
     variants.push((
         "truncated-header-1",
-        good[..SHARD_ROOMS_HEADER_LEN - 1].to_vec(),
+        good[..SHARD_COLLECTIONS_HEADER_LEN - 1].to_vec(),
     ));
-    variants.push(("truncated-header", good[..SHARD_ROOMS_HEADER_LEN].to_vec()));
+    variants.push((
+        "truncated-header",
+        good[..SHARD_COLLECTIONS_HEADER_LEN].to_vec(),
+    ));
     variants.push(("truncated-record", good[..good.len() - 1].to_vec()));
 
     for (name, bytes) in &variants {
@@ -2746,7 +2749,7 @@ fn shard_collections_checksum_rejects_damage_and_rebuilds_accounting() {
     let rebuilt = read_persisted_shard_collections(&dir).expect("rewritten v2 sidecar");
     assert_eq!(
         rebuilt.records.len(),
-        (good.len() - SHARD_ROOMS_HEADER_LEN) / SHARD_ROOMS_RECORD_LEN
+        (good.len() - SHARD_COLLECTIONS_HEADER_LEN) / SHARD_COLLECTIONS_RECORD_LEN
     );
     let mut from_disk = PackfileStorage::collection_directory_from_disk(&dir);
     from_disk.sort_unstable_by_key(|(id, _)| *id);
@@ -2780,10 +2783,11 @@ fn header_only_shard_collections_is_valid_but_truncating_a_populated_one_is_not(
     // A populated file cut to the same header is damaged: its original CRC
     // covered the records that are now gone.
     let mut populated = header_only_shard_collections();
-    populated.extend_from_slice(&[0xAB; SHARD_ROOMS_RECORD_LEN]);
+    populated.extend_from_slice(&[0xAB; SHARD_COLLECTIONS_RECORD_LEN]);
     let crc = crc32fast::hash(&populated);
-    populated[SHARD_ROOMS_CRC_OFFSET..SHARD_ROOMS_HEADER_LEN].copy_from_slice(&crc.to_le_bytes());
-    std::fs::write(&sidecar, &populated[..SHARD_ROOMS_HEADER_LEN]).unwrap();
+    populated[SHARD_ROOMS_CRC_OFFSET..SHARD_COLLECTIONS_HEADER_LEN]
+        .copy_from_slice(&crc.to_le_bytes());
+    std::fs::write(&sidecar, &populated[..SHARD_COLLECTIONS_HEADER_LEN]).unwrap();
     assert!(
         read_persisted_shard_collections(&dir).is_none(),
         "truncating a populated sidecar must fail its CRC"
@@ -4423,7 +4427,7 @@ fn reopen_probe_put_range(
     }
 }
 
-fn reopen_probe_load_factor(room: &RoomGeneration) -> f64 {
+fn reopen_probe_load_factor(room: &CollectionGeneration) -> f64 {
     f64::from(u32::try_from(room.index.len()).expect("probe index length fits in u32"))
         / f64::from(room.index.capacity())
 }
@@ -13581,12 +13585,12 @@ fn ordered_index_point_mapping_leaves_event_bodies_sequential() {
         .unwrap();
 
     let scope = [0x63; 16];
-    let index = crate::timeline::OrderedIndex::<_, crate::timeline::ScopedSeqKey>::open(
+    let index = crate::ordered_index::OrderedIndex::<_, crate::ordered_index::ScopedSeqKey>::open(
         &store,
         "point_mapping_scope_test",
     );
     index
-        .build(&[crate::timeline::ScopedSeqKey::new(
+        .build(&[crate::ordered_index::ScopedSeqKey::new(
             scope,
             1,
             0,

@@ -1,24 +1,24 @@
 //! Matrix event timeline adapters over the protocol-neutral ordered index.
 //!
 //! The two key types are deliberately minimal projections of
-//! [`EventTimelineEntry`](crate::ordered_timeline::EventTimelineEntry):
+//! [`EventTimelineEntry`](crate::event_timeline::EventTimelineEntry):
 //!
-//! - [`EventTopoKey`](crate::ordered_timeline::EventTopoKey) orders by `(room, depth, origin_server_ts, node id)`.
-//! - [`EventStreamKey`](crate::ordered_timeline::EventStreamKey) orders by `(room, stream ordering, node id)`.
+//! - [`EventTopoKey`](crate::event_timeline::EventTopoKey) orders by `(room, depth, origin_server_ts, node id)`.
+//! - [`EventStreamKey`](crate::event_timeline::EventStreamKey) orders by `(room, stream ordering, node id)`.
 //!
 //! A field that belongs only to the other projection is not duplicated in the
 //! key; the node id completes each total order. Callers that need both
-//! positions must keep the domain [`EventTimelineEntry`](crate::ordered_timeline::EventTimelineEntry) or fetch the event.
+//! positions must keep the domain [`EventTimelineEntry`](crate::event_timeline::EventTimelineEntry) or fetch the event.
 //! Their cursors are distinct Rust types, and their collections are shared
 //! across rooms.
 
 use crate::database::DatabaseTransaction;
 use crate::define_ordered_key;
 use crate::layout::ShardType;
+use crate::ordered_index::{OrderedCursor, OrderedIndex, OrderedKey, OrderedPage};
 use crate::packfile::storage::PackfileStorage;
 use crate::storage::{NodeData, NodeId, StorageEngine, StorageError};
 use crate::template::CollectionMetadata;
-use crate::timeline::{OrderedCursor, OrderedIndex, OrderedKey, OrderedPage};
 
 /// Stable logical name shared by both event-order key schemas.
 pub const EVENT_TIMELINE_INDEX_NAME: &str = "event-timeline-v2";
@@ -561,5 +561,5 @@ fn max_stream_key(room_scope: [u8; 16], persisted_up_to: i64) -> EventStreamKey 
 }
 
 #[cfg(test)]
-#[path = "test_ordered_timeline.rs"]
+#[path = "test_event_timeline.rs"]
 mod tests;

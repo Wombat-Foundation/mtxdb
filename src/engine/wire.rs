@@ -83,7 +83,7 @@ impl<const N: usize> OrderedField for [u8; N] {
     }
 }
 
-/// Define a fixed-width ordered key and its [`crate::timeline::OrderedKey`]
+/// Define a fixed-width ordered key and its [`crate::ordered_index::OrderedKey`]
 /// implementation from a field list.
 ///
 /// The leading field is the scan prefix; the remaining fields are compared in
@@ -121,7 +121,7 @@ macro_rules! define_ordered_key {
             )+
         }
 
-        impl $crate::timeline::OrderedKey for $name {
+        impl $crate::ordered_index::OrderedKey for $name {
             type Prefix = $prefix_ty;
 
             const WIRE_LEN: usize = <$prefix_ty as $crate::wire::OrderedField>::LEN

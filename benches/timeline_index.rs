@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
-use mtxdb::timeline::{TimelineEntry, TimelineIndex, TIMELINE_LEAF_CAP};
+use mtxdb::ordered_index::{TimelineEntry, TimelineIndex, TIMELINE_LEAF_CAP};
 use mtxdb::PackfileStorage;
 
 const EVENT_COLLECTION: [u8; 16] = *b"timeline-events!";

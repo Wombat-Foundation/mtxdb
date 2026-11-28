@@ -3512,9 +3512,9 @@ fn cmd_timeline_single(cli: &Cli, room: &str, limit: i64, reverse: bool) -> anyh
     let layout = open_layout(cli)?;
     let pool = pool_dir(&layout, ShardType::EventDag)?;
     let store = open_pool_read_only(pool).context("failed to open EventDag store")?;
-    let timeline_index = mtxdb::ordered_timeline::EventTopoIndex::open(
+    let timeline_index = mtxdb::event_timeline::EventTopoIndex::open(
         &store,
-        mtxdb::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+        mtxdb::event_timeline::EVENT_TIMELINE_INDEX_NAME,
     );
     let room_scope = mtxdb::room_scope_id(room.as_bytes());
     let limit_usize = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);

@@ -18,8 +18,8 @@ use crate::storage::StorageError;
 use super::{retire_delta_epoch_file, TailHook};
 use super::{
     CapturedCheckpoint, CheckpointBodySource, CheckpointBreakdown, CheckpointTail,
-    CheckpointWorker, DeltaBatchTooLarge, DeltaLogState, PackfileStorage, PendingDelta,
-    RecordLocator, RoomGeneration, V1PendingBatch, PACK_INDEX_OFFSET_LIMIT,
+    CheckpointWorker, CollectionGeneration, DeltaBatchTooLarge, DeltaLogState, PackfileStorage,
+    PendingDelta, RecordLocator, V1PendingBatch, PACK_INDEX_OFFSET_LIMIT,
 };
 
 impl PackfileStorage {
@@ -103,7 +103,7 @@ impl PackfileStorage {
     /// Snapshot every collection's live generation for a checkpoint, encoded as
     /// `(collection_id, generation, room)`. Callers hold all collection put
     /// mutexes, so the snapshot is a consistent point in the index.
-    pub(super) fn checkpoint_snapshots(&self) -> Vec<([u8; 16], u64, Arc<RoomGeneration>)> {
+    pub(super) fn checkpoint_snapshots(&self) -> Vec<([u8; 16], u64, Arc<CollectionGeneration>)> {
         let tables = self.index_tables.read();
         tables
             .collection_order
@@ -265,7 +265,7 @@ impl PackfileStorage {
         //     durable leaves D1 orphaned (no checkpoint names its
         //     fingerprint) and correctly ignored; the reopen uses C0 + D0.
         //
-        // `RoomGeneration` is immutable once published (COW, swapped
+        // `CollectionGeneration` is immutable once published (COW, swapped
         // atomically), so an owned `Arc` clone taken under the lock is as
         // good a snapshot as the live one for serialization purposes.
         let mut collection_ids: Vec<[u8; 16]> = self.collections_read().keys().copied().collect();
@@ -460,7 +460,7 @@ impl PackfileStorage {
         fingerprint: u64,
         covered_lsn: u64,
         base_delta_seq: u64,
-        snapshots: &[([u8; 16], u64, Arc<RoomGeneration>)],
+        snapshots: &[([u8; 16], u64, Arc<CollectionGeneration>)],
         pack_table: &[(u16, PackId)],
         logical_versions: &[([u8; 16], u64)],
     ) -> std::io::Result<std::time::Duration> {
@@ -671,7 +671,7 @@ impl PackfileStorage {
     pub(super) fn rotate_delta_epoch(
         &self,
         fingerprint: u64,
-        snapshots: &[([u8; 16], u64, Arc<RoomGeneration>)],
+        snapshots: &[([u8; 16], u64, Arc<CollectionGeneration>)],
     ) -> Option<u64> {
         let mut state = self.delta_state.lock();
         let old_base_fingerprint = state.base_fingerprint;

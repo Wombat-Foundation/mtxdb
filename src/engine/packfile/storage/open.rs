@@ -13,10 +13,10 @@ use crate::shard::ShardPool;
 use crate::storage::StorageError;
 
 use super::{
-    persisted_collection_order, DeltaLogState, IndexTables, OpenPath, OpenTimings,
-    OperationTimings, PackfileStorage, ReadPlanPolicy, ReloadMode, RoomScanOutput,
-    ScanInsertConfig, StreamingOpenScan, SwizzleFn, SyncDiagnostics, SyncTotals,
-    DEFAULT_CACHE_CAPACITY, DEFAULT_DELTA_FSYNC_BUDGET_BYTES, DEFAULT_PACK_FSYNC_BUDGET_BYTES,
+    persisted_collection_order, CollectionScanOutput, DeltaLogState, IndexTables, OpenPath,
+    OpenTimings, OperationTimings, PackfileStorage, ReadPlanPolicy, ReloadMode, ScanInsertConfig,
+    StreamingOpenScan, SwizzleFn, SyncDiagnostics, SyncTotals, DEFAULT_CACHE_CAPACITY,
+    DEFAULT_DELTA_FSYNC_BUDGET_BYTES, DEFAULT_PACK_FSYNC_BUDGET_BYTES,
     DEFAULT_REPACK_THRESHOLD_ENTRIES,
 };
 
@@ -727,7 +727,7 @@ impl PackfileStorage {
     )]
     fn assemble(
         shards: ShardPool,
-        scan_out: RoomScanOutput,
+        scan_out: CollectionScanOutput,
         collection_order: Vec<[u8; 16]>,
         deleted_collections: HashSet<[u8; 16]>,
         collection_generation_fences: HashMap<[u8; 16], u32>,

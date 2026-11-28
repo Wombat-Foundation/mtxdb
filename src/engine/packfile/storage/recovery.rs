@@ -14,8 +14,8 @@ use crate::shard::ShardPool;
 
 use super::{
     disk_bytes_from_physical, read_persisted_shard_collections, BookkeepingSource,
-    CheckpointReject, DeltaLogState, DurableIndexState, OpenTimings, PackfileStorage, ReloadMode,
-    RoomGeneration, RoomScanOutput,
+    CheckpointReject, CollectionGeneration, CollectionScanOutput, DeltaLogState, DurableIndexState,
+    OpenTimings, PackfileStorage, ReloadMode,
 };
 
 impl PackfileStorage {
@@ -153,7 +153,7 @@ impl PackfileStorage {
         reload_mode: ReloadMode,
         index_config: crate::index::IndexConfig,
         timings: &mut OpenTimings,
-    ) -> Option<(RoomScanOutput, Vec<[u8; 16]>, DeltaLogState, u64)> {
+    ) -> Option<(CollectionScanOutput, Vec<[u8; 16]>, DeltaLogState, u64)> {
         let decode_started = std::time::Instant::now();
         let checkpoint =
             crate::index::checkpoint::read_checkpoint(&Self::index_checkpoint_path(base_dir));
@@ -482,9 +482,9 @@ impl PackfileStorage {
         // Gating needs each collection's post-replay length (the checkpoint
         // occupancy plus whatever fresh-slot writes the replayed frames add),
         // so the sidecar check runs after materialization below.
-        let mut scan_out = RoomScanOutput {
+        let mut scan_out = CollectionScanOutput {
             index_identity_reads,
-            ..RoomScanOutput::default()
+            ..CollectionScanOutput::default()
         };
         let mut collection_order = Vec::with_capacity(checkpoint.collections.len());
         let mut current_len: HashMap<[u8; 16], u32> =
@@ -554,7 +554,7 @@ impl PackfileStorage {
             current_len.insert(loaded.collection_id, len);
             scan_out.collections.insert(
                 loaded.collection_id,
-                ArcSwap::from_pointee(RoomGeneration {
+                ArcSwap::from_pointee(CollectionGeneration {
                     index,
                     cache: Arc::new(NodeCache::with_budget(
                         cache_capacity,
@@ -603,7 +603,7 @@ impl PackfileStorage {
             current_len.insert(collection_id, len);
             scan_out.collections.insert(
                 collection_id,
-                ArcSwap::from_pointee(RoomGeneration {
+                ArcSwap::from_pointee(CollectionGeneration {
                     index,
                     cache: Arc::new(NodeCache::with_budget(
                         cache_capacity,

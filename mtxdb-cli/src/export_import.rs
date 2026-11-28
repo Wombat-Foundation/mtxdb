@@ -2339,7 +2339,7 @@ pub(crate) fn write_room_with_resolved_findings(
 
     let room_scope = mtxdb::room_scope_id(room);
     let (topo_index, stream_index) =
-        mtxdb::ordered_timeline::open_event_timeline_indexes(db.pool(EVENT_POOL).as_ref());
+        mtxdb::event_timeline::open_event_timeline_indexes(db.pool(EVENT_POOL).as_ref());
     let mut batch_timeline_entries = Vec::new();
     let mut batch_payloads = Vec::new();
 
@@ -2388,7 +2388,7 @@ pub(crate) fn write_room_with_resolved_findings(
                     export.room_id
                 );
             }
-            mtxdb::ordered_timeline::stage_event_timeline_batch(
+            mtxdb::event_timeline::stage_event_timeline_batch(
                 &tx,
                 EVENT_POOL,
                 event_collection,
@@ -2455,7 +2455,7 @@ pub(crate) fn write_room_with_resolved_findings(
         if let Some((topological_ordering, stream_ordering)) =
             timeline_orderings(export, event, rejected)
         {
-            batch_timeline_entries.push(mtxdb::ordered_timeline::EventTimelineEntry::new(
+            batch_timeline_entries.push(mtxdb::event_timeline::EventTimelineEntry::new(
                 room_scope,
                 topological_ordering,
                 timeline_origin_server_ts(event),
@@ -2468,7 +2468,7 @@ pub(crate) fn write_room_with_resolved_findings(
         written = written.saturating_add(1);
     }
 
-    mtxdb::ordered_timeline::stage_event_timeline_batch(
+    mtxdb::event_timeline::stage_event_timeline_batch(
         &tx,
         EVENT_POOL,
         event_collection,

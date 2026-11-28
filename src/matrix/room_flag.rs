@@ -12,12 +12,12 @@ use bytes::Bytes;
 use crate::bitmap_set::{BitmapSet, DomainTag};
 use crate::csr_adjacency::CsrAdjacency;
 use crate::database::{Database, DatabaseTransaction};
+use crate::event_timeline::EventTopoIndex;
 use crate::interop::{
     decode_verdict, derive_id, event_record_id, event_verdict_collection_id,
     room_event_collection_id, room_flag_collection_id, room_scope_id,
 };
 use crate::layout::ShardType;
-use crate::ordered_timeline::EventTopoIndex;
 use crate::short_id::ShortIdIndex;
 use crate::storage::{NodeData, NodeId, StorageEngine, StorageError};
 
@@ -999,7 +999,7 @@ impl RoomFlagIndex {
     fn timeline_nodes(&self, db: &Database) -> Result<Vec<NodeId>, StorageError> {
         let timeline_index = EventTopoIndex::open(
             db.pool(ShardType::EventDag).as_ref(),
-            crate::ordered_timeline::EVENT_TIMELINE_INDEX_NAME,
+            crate::event_timeline::EVENT_TIMELINE_INDEX_NAME,
         );
         let room_scope = room_scope_id(&self.room_id);
         let mut cursor = None;

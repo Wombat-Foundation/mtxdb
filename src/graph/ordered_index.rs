@@ -23,8 +23,8 @@
 //! are not stable.
 //!
 //! Layout (all content-addressed, immutable except the head):
-//! - **leaf** (`TMLF`): up to [`crate::timeline::TIMELINE_LEAF_CAP`] sorted entries;
-//! - **directory** (`TMLD`): up to [`crate::timeline::TIMELINE_DIRECTORY_FANOUT`] leaf
+//! - **leaf** (`TMLF`): up to [`crate::ordered_index::TIMELINE_LEAF_CAP`] sorted entries;
+//! - **directory** (`TMLD`): up to [`crate::ordered_index::TIMELINE_DIRECTORY_FANOUT`] leaf
 //!   descriptors with minimum, maximum, and entry count;
 //! - **root** (`TMLR`): an ordered directory manifest plus total entry count;
 //! - **head** (`TMLH`): a fixed-id record holding the current root id, the only
@@ -3947,5 +3947,5 @@ fn decode_head<K: OrderedKey>(
 }
 
 #[cfg(test)]
-#[path = "test_timeline.rs"]
+#[path = "test_ordered_index.rs"]
 mod tests;

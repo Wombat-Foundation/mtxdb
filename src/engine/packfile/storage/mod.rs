@@ -989,8 +989,8 @@ pub type CollectionSummary = ([u8; 16], usize, usize, u32);
 /// Accumulator for the collection generations and shard accounting assembled
 /// after either a checkpoint load or a full scan.
 #[derive(Default)]
-struct RoomScanOutput {
-    collections: HashMap<[u8; 16], ArcSwap<RoomGeneration>>,
+struct CollectionScanOutput {
+    collections: HashMap<[u8; 16], ArcSwap<CollectionGeneration>>,
     shard_collections: HashMap<PackId, HashMap<[u8; 16], u64>>,
     collection_shards: HashMap<[u8; 16], HashSet<PackId>>,
     collection_disk_bytes: HashMap<PackId, HashMap<[u8; 16], u64>>,
@@ -1034,7 +1034,7 @@ struct ScanLocator {
 
 type PreparedCollectionScan = (
     [u8; 16],
-    Option<Arc<RoomGeneration>>,
+    Option<Arc<CollectionGeneration>>,
     Vec<(u16, Arc<Shard>)>,
     Vec<(u64, packfile::PackfileScanner)>,
 );
@@ -1141,7 +1141,7 @@ impl StreamingOpenScan {
         shards: &ShardPool,
         cache_capacity: usize,
         cache_budget: Option<&Arc<crate::cache::CacheBudget>>,
-    ) -> (RoomScanOutput, Vec<[u8; 16]>) {
+    ) -> (CollectionScanOutput, Vec<[u8; 16]>) {
         self.collection_order
             .retain(|collection_id| self.seen_collections.contains(collection_id));
         let slot_to_pack_id: HashMap<u16, PackId> = shards
@@ -1149,10 +1149,10 @@ impl StreamingOpenScan {
             .into_iter()
             .map(|(slot, shard)| (slot, shard.pack_id))
             .collect();
-        let mut out = RoomScanOutput {
+        let mut out = CollectionScanOutput {
             collection_disk_bytes: self.collection_disk_bytes,
             index_identity_reads: self.index_identity_reads,
-            ..RoomScanOutput::default()
+            ..CollectionScanOutput::default()
         };
         let index_config = crate::index::IndexConfig {
             seed: shards.bucket_seed(),
@@ -1182,7 +1182,7 @@ impl StreamingOpenScan {
             }
             out.collections.insert(
                 collection_id,
-                ArcSwap::from_pointee(RoomGeneration {
+                ArcSwap::from_pointee(CollectionGeneration {
                     index,
                     cache: Arc::new(NodeCache::with_budget(
                         cache_capacity,
@@ -1232,10 +1232,10 @@ const SHARD_ROOMS_VERSION: u8 = 2;
 /// `persisted_at(8)`.
 const SHARD_ROOMS_CRC_OFFSET: usize = 4 + 1 + 8 + 8;
 /// Header size: the fields above plus the CRC32(4).
-const SHARD_ROOMS_HEADER_LEN: usize = SHARD_ROOMS_CRC_OFFSET + 4;
+const SHARD_COLLECTIONS_HEADER_LEN: usize = SHARD_ROOMS_CRC_OFFSET + 4;
 /// One entry: `pack_id`(16) + `collection_id`(16) + count(8) + the
 /// collection's stable insertion ordinal(8) + disk bytes(8).
-const SHARD_ROOMS_RECORD_LEN: usize = crate::packfile::PACK_ID_LEN + 16 + 8 + 8 + 8;
+const SHARD_COLLECTIONS_RECORD_LEN: usize = crate::packfile::PACK_ID_LEN + 16 + 8 + 8 + 8;
 
 /// The largest record offset representable in the bucket locator's 48-bit
 /// offset field. Pack rotation normally keeps offsets below this ceiling.
@@ -1602,7 +1602,7 @@ fn shard_rooms_crc(buf: &[u8]) -> u32 {
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(&buf[..SHARD_ROOMS_CRC_OFFSET]);
     hasher.update(&[0u8; 4]);
-    hasher.update(&buf[SHARD_ROOMS_HEADER_LEN..]);
+    hasher.update(&buf[SHARD_COLLECTIONS_HEADER_LEN..]);
     hasher.finalize()
 }
 
@@ -1614,28 +1614,28 @@ pub fn read_persisted_shard_collections(
     base_dir: &std::path::Path,
 ) -> Option<PersistedShardDirectory> {
     let buf = fs::read(base_dir.join("shard_collections.bin")).ok()?;
-    if buf.len() < SHARD_ROOMS_HEADER_LEN
+    if buf.len() < SHARD_COLLECTIONS_HEADER_LEN
         || &buf[0..4] != SHARD_ROOMS_MAGIC
         || buf[4] != SHARD_ROOMS_VERSION
     {
         return None;
     }
     let stored_crc = u32::from_le_bytes(
-        buf[SHARD_ROOMS_CRC_OFFSET..SHARD_ROOMS_HEADER_LEN]
+        buf[SHARD_ROOMS_CRC_OFFSET..SHARD_COLLECTIONS_HEADER_LEN]
             .try_into()
             .ok()?,
     );
     if shard_rooms_crc(&buf) != stored_crc {
         return None;
     }
-    let body = &buf[SHARD_ROOMS_HEADER_LEN..];
-    if body.len().checked_rem(SHARD_ROOMS_RECORD_LEN) != Some(0) {
+    let body = &buf[SHARD_COLLECTIONS_HEADER_LEN..];
+    if body.len().checked_rem(SHARD_COLLECTIONS_RECORD_LEN) != Some(0) {
         return None;
     }
     let fingerprint = u64::from_le_bytes(buf[5..13].try_into().ok()?);
     let persisted_at = u64::from_le_bytes(buf[13..21].try_into().ok()?);
     let records = body
-        .as_chunks::<SHARD_ROOMS_RECORD_LEN>()
+        .as_chunks::<SHARD_COLLECTIONS_RECORD_LEN>()
         .0
         .iter()
         .map(|chunk| {
@@ -1711,13 +1711,13 @@ static SHARD_ROOMS_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// stamps every frame with the generation it was recorded under, so a log
 /// never replay-applies frames for a pre-resize table onto a resized one.
 #[derive(Clone)]
-struct RoomGeneration {
+struct CollectionGeneration {
     index: BucketIndex,
     cache: Arc<NodeCache>,
     generation: u64,
 }
 
-impl RoomGeneration {
+impl CollectionGeneration {
     /// Locators to try for one key, from the resident index.
     fn candidates(&self, id: &NodeId) -> Vec<(u16, u64)> {
         self.index.lookup_all(id).collect()
@@ -1863,7 +1863,7 @@ impl Iterator for CollectionScan<'_> {
 type DeletedCollectionsCache = Option<(u64, u64, HashSet<[u8; 16]>)>;
 
 struct IndexTables {
-    collections: HashMap<[u8; 16], ArcSwap<RoomGeneration>>,
+    collections: HashMap<[u8; 16], ArcSwap<CollectionGeneration>>,
     collection_order: Vec<[u8; 16]>,
     shard_collections: HashMap<PackId, HashMap<[u8; 16], u64>>,
     collection_shards: HashMap<[u8; 16], HashSet<PackId>>,
@@ -1957,7 +1957,7 @@ pub const DEFAULT_DELTA_FSYNC_BUDGET_BYTES: u64 = 1 << 20;
 /// file descriptor usage constant regardless of collection count.
 ///
 /// Per-collection state (index + cache) is bundled in an immutable
-/// `RoomGeneration` and swapped atomically via `ArcSwap`:
+/// `CollectionGeneration` and swapped atomically via `ArcSwap`:
 ///
 /// - **Reads**: `load_full()` once, see a consistent snapshot.
 /// - **Writes**: build new generation under put lock, swap atomically.
@@ -2278,7 +2278,7 @@ pub struct PackfileStorage {
     index_checkpoint_dirty: AtomicBool,
     /// The shard→collection sidecar is known missing or invalid and must be
     /// regenerated even though no index is dirty (see
-    /// `RoomScanOutput::sidecar_missing`). Distinct from
+    /// `CollectionScanOutput::sidecar_missing`). Distinct from
     /// `shard_collections_stale`: that flag only says ordinary writes have
     /// advanced the in-memory bookkeeping past the on-disk copy, which is
     /// deferred to the next persistence anchor.
@@ -2704,7 +2704,10 @@ impl PackfileStorage {
         (BookkeepingSource::Sidecar, counts)
     }
 
-    fn generation(&self, collection_id: &[u8; 16]) -> Option<arc_swap::Guard<Arc<RoomGeneration>>> {
+    fn generation(
+        &self,
+        collection_id: &[u8; 16],
+    ) -> Option<arc_swap::Guard<Arc<CollectionGeneration>>> {
         self.collections_read()
             .get(collection_id)
             .map(arc_swap::ArcSwapAny::load)
@@ -2712,13 +2715,15 @@ impl PackfileStorage {
 
     fn collections_read(
         &self,
-    ) -> parking_lot::MappedRwLockReadGuard<'_, HashMap<[u8; 16], ArcSwap<RoomGeneration>>> {
+    ) -> parking_lot::MappedRwLockReadGuard<'_, HashMap<[u8; 16], ArcSwap<CollectionGeneration>>>
+    {
         parking_lot::RwLockReadGuard::map(self.index_tables.read(), |tables| &tables.collections)
     }
 
     fn collections_write(
         &self,
-    ) -> parking_lot::MappedRwLockWriteGuard<'_, HashMap<[u8; 16], ArcSwap<RoomGeneration>>> {
+    ) -> parking_lot::MappedRwLockWriteGuard<'_, HashMap<[u8; 16], ArcSwap<CollectionGeneration>>>
+    {
         parking_lot::RwLockWriteGuard::map(self.index_tables.write(), |tables| {
             &mut tables.collections
         })
@@ -3341,7 +3346,7 @@ impl PackfileStorage {
                 if generation.index.is_mmap_backed() {
                     generation
                 } else {
-                    Arc::new(RoomGeneration {
+                    Arc::new(CollectionGeneration {
                         index: generation.index.clone(),
                         cache: Arc::clone(&generation.cache),
                         generation: generation.generation,
@@ -3377,7 +3382,7 @@ impl PackfileStorage {
     /// captured and the collection put lock has been released.
     fn finish_collection_pack_scan(
         &self,
-        generation: Option<&RoomGeneration>,
+        generation: Option<&CollectionGeneration>,
         shards: &[(u16, Arc<Shard>)],
         scanners: Vec<(u64, packfile::PackfileScanner)>,
         collection_id: &[u8; 16],
@@ -3490,7 +3495,7 @@ impl PackfileStorage {
             if generation.index.is_mmap_backed() {
                 generation
             } else {
-                Arc::new(RoomGeneration {
+                Arc::new(CollectionGeneration {
                     index: generation.index.clone(),
                     cache: Arc::clone(&generation.cache),
                     generation: generation.generation,
@@ -3597,7 +3602,7 @@ impl PackfileStorage {
     )]
     fn append_collection_locator_work(
         keys: Vec<NodeId>,
-        generation: &RoomGeneration,
+        generation: &CollectionGeneration,
         overlay_puts: &HashMap<NodeId, NodeData>,
         overlay_removes: &HashSet<NodeId>,
         shards: &[(u16, Arc<Shard>)],
@@ -4333,7 +4338,8 @@ impl PackfileStorage {
         // bit-flipped sidecar fails the reader's check and is treated as
         // missing, so this file can be published without its own data sync.
         let crc = crc32fast::hash(&buf);
-        buf[SHARD_ROOMS_CRC_OFFSET..SHARD_ROOMS_HEADER_LEN].copy_from_slice(&crc.to_le_bytes());
+        buf[SHARD_ROOMS_CRC_OFFSET..SHARD_COLLECTIONS_HEADER_LEN]
+            .copy_from_slice(&crc.to_le_bytes());
 
         let unique = SHARD_ROOMS_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp_path = Self::shard_collections_path(&self.base_dir)
@@ -4619,8 +4625,8 @@ impl PackfileStorage {
     /// an index lookup and pinning those shards. A stable generation means the
     /// pin happened before any retirement.
     fn same_generation(
-        current: Option<&arc_swap::Guard<Arc<RoomGeneration>>>,
-        loaded: &arc_swap::Guard<Arc<RoomGeneration>>,
+        current: Option<&arc_swap::Guard<Arc<CollectionGeneration>>>,
+        loaded: &arc_swap::Guard<Arc<CollectionGeneration>>,
     ) -> bool {
         current.is_some_and(|current| Arc::ptr_eq(&**current, &**loaded))
     }
@@ -4678,7 +4684,7 @@ impl PackfileStorage {
         let generation = self.generation(collection_id).map_or(1, |gen| {
             gen.generation.saturating_add(u64::from(bump_generation))
         });
-        let new_gen = Arc::new(RoomGeneration {
+        let new_gen = Arc::new(CollectionGeneration {
             index,
             cache,
             generation,
@@ -4696,7 +4702,7 @@ impl PackfileStorage {
                 .collections
                 .entry(*collection_id)
                 .or_insert_with(|| {
-                    ArcSwap::from_pointee(RoomGeneration {
+                    ArcSwap::from_pointee(CollectionGeneration {
                         index: BucketIndex::new(0),
                         cache: Arc::new(NodeCache::with_budget(
                             self.cache_capacity,
@@ -4721,7 +4727,7 @@ impl PackfileStorage {
                 self.collections_write()
                     .entry(*collection_id)
                     .or_insert_with(|| {
-                        ArcSwap::from_pointee(RoomGeneration {
+                        ArcSwap::from_pointee(CollectionGeneration {
                             index: BucketIndex::new(0),
                             cache: Arc::new(NodeCache::with_budget(
                                 self.cache_capacity,
@@ -5141,7 +5147,7 @@ impl PackfileStorage {
     /// runaway case above, where `stop_at` never gets hit.
     fn bfs_ancestors(
         &self,
-        gen: &Arc<RoomGeneration>,
+        gen: &Arc<CollectionGeneration>,
         frontier: &[[u8; 16]],
         stop_at: &[[u8; 16]],
         extract_edges: &impl Fn(&[u8; 16], &[u8]) -> Vec<[u8; 16]>,
@@ -5211,7 +5217,7 @@ impl PackfileStorage {
     /// miss.
     fn resolve_pinned(
         &self,
-        gen: &Arc<RoomGeneration>,
+        gen: &Arc<CollectionGeneration>,
         pinned: &HashMap<u16, Arc<Shard>>,
         id: &NodeId,
     ) -> Result<Option<NodeData>, StorageError> {
@@ -5384,7 +5390,7 @@ impl PackfileStorage {
         id: &NodeId,
         data: &NodeData,
         metadata: Option<FrameMetadata>,
-        old_gen: Option<&RoomGeneration>,
+        old_gen: Option<&CollectionGeneration>,
         batch_lsn: Option<u64>,
         progress: &mut PutManyProgress,
     ) -> Result<(), StorageError> {
@@ -5430,7 +5436,7 @@ impl PackfileStorage {
         &self,
         collection_id: &[u8; 16],
         id: &NodeId,
-        old_gen: Option<&RoomGeneration>,
+        old_gen: Option<&CollectionGeneration>,
         locator: RecordLocator,
         progress: &mut PutManyProgress,
     ) -> Result<(), StorageError> {
@@ -5610,7 +5616,7 @@ impl PackfileStorage {
 
     fn prepare_put_many_progress(
         &self,
-        old_gen: Option<&RoomGeneration>,
+        old_gen: Option<&CollectionGeneration>,
         entries_len: usize,
     ) -> PutManyProgress {
         let started = std::time::Instant::now();
@@ -5678,7 +5684,7 @@ impl PackfileStorage {
         collection_id: &[u8; 16],
         entries: &[(NodeId, NodeData)],
         metadatas: Option<&[Option<FrameMetadata>]>,
-        old_gen: Option<&RoomGeneration>,
+        old_gen: Option<&CollectionGeneration>,
         progress: &mut PutManyProgress,
     ) -> Result<(), StorageError> {
         // Publish the whole batch as one group when it fits. This is the same
@@ -6925,7 +6931,7 @@ impl PackfileStorage {
     }
 
     /// Count a collection's durable live records in the resident index.
-    fn durable_live_count(generation: &RoomGeneration) -> usize {
+    fn durable_live_count(generation: &CollectionGeneration) -> usize {
         generation.index.live_count()
     }
 
@@ -9318,7 +9324,7 @@ struct CheckpointBodySource<'a> {
     fingerprint: u64,
     base_delta_seq: u64,
     covered_lsn: Option<u64>,
-    snapshots: &'a [([u8; 16], u64, Arc<RoomGeneration>)],
+    snapshots: &'a [([u8; 16], u64, Arc<CollectionGeneration>)],
     pack_table: &'a [(u16, PackId)],
     logical_versions: &'a [([u8; 16], u64)],
 }

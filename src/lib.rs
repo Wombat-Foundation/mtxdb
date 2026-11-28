@@ -91,6 +91,9 @@ pub mod domain_tag;
 /// Journaled write-ahead log of event edges, replayed into the CSR after a crash.
 #[path = "matrix/edge_log.rs"]
 pub mod edge_log;
+/// Matrix event timeline key layouts over the generic ordered sidecar tree.
+#[path = "matrix/event_timeline.rs"]
+pub mod event_timeline;
 #[path = "matrix/export_schema.rs"]
 pub mod export_schema;
 /// Persisted, content-addressed HAMTs in an mtxdb collection, generic over
@@ -132,9 +135,9 @@ pub mod logical_head;
 /// Matrix-specific room-version policy.
 #[path = "matrix/matrix_policy.rs"]
 pub mod matrix_policy;
-/// Matrix event timeline key layouts over the generic ordered sidecar tree.
-#[path = "matrix/ordered_timeline.rs"]
-pub mod ordered_timeline;
+/// Generic persisted ordered index with copy-on-write roots.
+#[path = "graph/ordered_index.rs"]
+pub mod ordered_index;
 /// On-disk packfile format and the storage engine built on top of it.
 #[path = "engine/packfile/mod.rs"]
 pub mod packfile;
@@ -175,9 +178,6 @@ pub mod storage;
 /// Executable policy primitives for application collection templates.
 #[path = "engine/template.rs"]
 pub mod template;
-/// Persisted, ordered timeline index with copy-on-write roots.
-#[path = "graph/timeline.rs"]
-pub mod timeline;
 /// Shared fixed-width key and compact-integer codecs.
 #[path = "engine/wire.rs"]
 pub mod wire;
@@ -250,6 +250,11 @@ pub use matrix_policy::{
     EventIdPolicy, MatrixRecordClass, MatrixRoomVersion, RedactionPolicy, ReferenceHashEncoding,
     ReferenceHashInputPolicy, RoomIdPolicy, RoomMetadata, StateResolutionPolicy,
 };
+pub use ordered_index::{
+    ordered_collection_id, timeline_collection_id, EventRef, KeyTag, OrderedCursor, OrderedIndex,
+    OrderedKey, OrderedPage, ScopedSeqKey, TimelineCursor, TimelineEntry, TimelineIndex,
+    TimelinePage, TIMELINE_FORMAT_VERSION, TIMELINE_LEAF_CAP,
+};
 pub use packfile::{
     storage::{OperationLatency, PackfileStorage, ReadPlanPolicy},
     FrameMetadata, Record,
@@ -294,11 +299,6 @@ pub use template::{
     MEMBER_NAMESPACE_PREV, MEMBER_NAMESPACE_STAT, MEMBER_NAMESPACE_STGP, NAMESPACE_BIAS_AUTH,
     NAMESPACE_BIAS_EVNT, NAMESPACE_BIAS_FLAG, NAMESPACE_BIAS_FWD, NAMESPACE_BIAS_INTL,
     NAMESPACE_BIAS_ORDX, NAMESPACE_BIAS_PREV, NAMESPACE_BIAS_STAT, NAMESPACE_BIAS_STGP,
-};
-pub use timeline::{
-    ordered_collection_id, timeline_collection_id, EventRef, KeyTag, OrderedCursor, OrderedIndex,
-    OrderedKey, OrderedPage, ScopedSeqKey, TimelineCursor, TimelineEntry, TimelineIndex,
-    TimelinePage, TIMELINE_FORMAT_VERSION, TIMELINE_LEAF_CAP,
 };
 
 #[cfg(test)]

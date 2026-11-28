@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use mtxdb::ordered_timeline::{
+use mtxdb::event_timeline::{
     open_event_timeline_indexes, page_stream_up_to, stage_event_timeline_batch,
     stage_promote_outlier_to_timeline, stage_purge_room_timeline,
     stage_remove_event_timeline_batch, EventStreamIndex, EventTimelineEntry,
