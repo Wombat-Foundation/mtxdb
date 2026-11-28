@@ -17,9 +17,9 @@ OVERALL_FLOOR = 85.0
 
 # Production paths where a regression would be a durability/recovery risk.
 FILE_FLOORS = {
-    "engine/journal.rs": 82.0,
+    "engine/journal/mod.rs": 82.0,
     "engine/shard.rs": 80.0,
-    "engine/packfile/storage.rs": 82.0,
+    "engine/packfile/storage/mod.rs": 82.0,
     "engine/packfile/mod.rs": 82.0,
     "engine/database.rs": 83.0,
     "engine/index/mod.rs": 93.0,

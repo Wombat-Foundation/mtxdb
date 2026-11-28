@@ -115,7 +115,7 @@ mod io;
 /// *read-committed overlay* built on top of it — letting a separate OS process
 /// observe a live writer's committed-but-not-yet-checkpointed data — is always
 /// available too; see `packfile::storage::read_journal`.
-#[path = "engine/journal.rs"]
+#[path = "engine/journal/mod.rs"]
 pub mod journal;
 /// Content-addressed state lattice checkpoint/chain codec.
 #[path = "matrix/lattice.rs"]
