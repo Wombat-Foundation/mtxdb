@@ -2526,64 +2526,6 @@ impl PackfileStorage {
         base_dir.join(crate::index::versions::INDEX_VERSIONS_FILE)
     }
 
-    /// Persist the collection-version table a delta log carries into
-    /// `index.versions` before a writable open can delete that log.
-    ///
-    /// A coverage batch lets the journal be reclaimed past the checkpoint's
-    /// own coverage, and the version table it carries is then the only durable
-    /// copy of the versions for the reclaimed groups. The open path deletes
-    /// delta logs in several places (a log that no longer matches the pack set,
-    /// a checkpoint rejected into a rescan), and every one
-    /// of them runs before [`Self::enable_shared_journal`] checks that the
-    /// baseline covers the reclaimed history. Deleting the log first leaves
-    /// nothing for that check to find, and every retry fails the same way.
-    /// Moving the table into its own file first makes the baseline independent
-    /// of what happens to the log.
-    ///
-    /// Only a table the reader already trusts is moved (see
-    /// [`Self::delta_version_table`]), and it is merged with `max` into any
-    /// existing file so neither a newer coverage nor a collection that only the
-    /// file knows is lost. A no-op when there is no such table or the file
-    /// already covers it.
-    ///
-    /// # Errors
-    /// Returns the write error. The caller must refuse the open rather than
-    /// continue: the log may be the only copy of those versions.
-    fn promote_delta_versions(base_dir: &std::path::Path) -> std::io::Result<()> {
-        let Some(table) = Self::delta_version_table(base_dir) else {
-            return Ok(());
-        };
-        if table.covered_lsn == 0 {
-            return Ok(());
-        }
-        let versions_path = Self::index_versions_path(base_dir);
-        // A missing file means this is the first promotion. A file that exists
-        // but cannot be read or decoded is not an empty baseline: writing the
-        // older delta table over it would destroy whatever versions it held.
-        let existing = crate::index::versions::read_versions_strict(&versions_path)?;
-        if existing
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.covered_lsn >= table.covered_lsn)
-        {
-            // A previous attempt may have renamed the file and then failed its
-            // directory sync; make that rename durable before the caller
-            // reclaims the log.
-            if let Some(dir) = versions_path.parent() {
-                crate::shard::sync_directory(dir)?;
-            }
-            return Ok(());
-        }
-        let mut merged: std::collections::BTreeMap<[u8; 16], u64> = existing
-            .map(|snapshot| snapshot.versions.into_iter().collect())
-            .unwrap_or_default();
-        for (collection, version) in table.entries {
-            let entry = merged.entry(collection).or_insert(0);
-            *entry = (*entry).max(version);
-        }
-        let merged: Vec<([u8; 16], u64)> = merged.into_iter().collect();
-        crate::index::versions::write_versions(&versions_path, &merged, table.covered_lsn)
-    }
-
     /// Path of one *epoch* of this store's incremental index delta log.
     ///
     /// Named by the checkpoint fingerprint it continues (`index.delta.<hex
@@ -2646,49 +2588,6 @@ impl PackfileStorage {
             return checkpoint_and_delta.max(versions_coverage);
         }
         recorded.max(checkpoint_and_delta)
-    }
-
-    /// What the disk records of the durable index state, in one pass over the
-    /// checkpoint and its delta log: the coverage the checkpoint records or a
-    /// committed batch of the log continuing it claims (whichever is newer; 0
-    /// when there is neither), and the fingerprint of the durable pack state
-    /// (0 when unknown). The log only counts if it names that checkpoint's
-    /// fingerprint; a stale epoch left by a crash is inert.
-    ///
-    /// Reading the checkpoint's own record matters: a new checkpoint retires
-    /// the delta epoch that held the newest claim, and `journal.lsn` is written
-    /// only after the checkpoint is durable, so for a moment the checkpoint's
-    /// header is the only place that coverage is written down.
-    fn durable_index_state(base_dir: &std::path::Path) -> DurableIndexState {
-        // The versions file is the coverage record that survives checkpoint
-        // retirement, so a crash between its fsync and `journal.lsn` must still
-        // recover the coverage it names.
-        let versions_coverage =
-            crate::index::versions::read_coverage(&Self::index_versions_path(base_dir))
-                .unwrap_or(0);
-        let Ok(Some(summary)) = crate::index::checkpoint::read_checkpoint_summary(
-            &Self::index_checkpoint_path(base_dir),
-        ) else {
-            return DurableIndexState {
-                covered_lsn: versions_coverage,
-                fingerprint: 0,
-            };
-        };
-        // One pass over the delta log yields both what it claims and where it
-        // ends; the log is only trusted if it names this checkpoint.
-        let tail =
-            delta::read_delta_tail_fingerprint(&Self::delta_path(base_dir, summary.fingerprint));
-        let (log_coverage, fingerprint) = match tail {
-            Ok(Some(tail)) if tail.base_fingerprint == summary.fingerprint => {
-                (tail.coverage.unwrap_or(0), tail.tail_fingerprint)
-            }
-            Ok(Some(_) | None) => (0, summary.fingerprint),
-            Err(_) => (0, 0),
-        };
-        DurableIndexState {
-            covered_lsn: summary.covered_lsn.max(log_coverage).max(versions_coverage),
-            fingerprint,
-        }
     }
 
     /// The newest complete version table carried by the delta log that
