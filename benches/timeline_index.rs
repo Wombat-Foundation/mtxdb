@@ -1,4 +1,4 @@
-//! Scaling harness for the prototype ordered timeline sidecar.
+//! Scaling harness for the prototype ordered-index sidecar.
 //!
 //! Run with `cargo bench --manifest-path benches/Cargo.toml --bench timeline_index`.
 //! `MTXDB_TIMELINE_SIZES` defaults to `10000,100000,1000000` and
@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use mtxdb::storage::{NodeData, NodeId, StorageEngine};
-use mtxdb::ordered_index::{TimelineEntry, TimelineIndex, TIMELINE_LEAF_CAP};
+use mtxdb::ordered_index::{OrderedIndex, ScopedSeqKey, ORDERED_LEAF_CAP};
 use mtxdb::PackfileStorage;
 
 const EVENT_COLLECTION: [u8; 16] = *b"timeline-events!";
@@ -35,12 +35,12 @@ fn node_id(n: u64) -> NodeId {
     id
 }
 
-fn entry(n: u64) -> TimelineEntry {
+fn entry(n: u64) -> ScopedSeqKey {
     let id = node_id(n);
     let mut reference = [0; 32];
     reference[..16].copy_from_slice(&id);
     reference[16..].copy_from_slice(&n.wrapping_mul(17).to_be_bytes().repeat(2));
-    TimelineEntry::new(ROOM, n as i64 - 500_000, n as i64 - 500_000, id, reference)
+    ScopedSeqKey::new(ROOM, n as i64 - 500_000, n as i64 - 500_000, id, reference)
 }
 
 fn payload(n: u64) -> Bytes {
@@ -52,7 +52,7 @@ fn payload(n: u64) -> Bytes {
     Bytes::from(bytes)
 }
 
-fn front_entry(offset: u64) -> TimelineEntry {
+fn front_entry(offset: u64) -> ScopedSeqKey {
     let offset_i64 = i64::try_from(offset).expect("front offset fits i64");
     let position = -500_001_i64
         .checked_sub(offset_i64)
@@ -64,7 +64,7 @@ fn front_entry(offset: u64) -> TimelineEntry {
     let mut reference = [0; 32];
     reference[..16].copy_from_slice(&id);
     reference[16..24].copy_from_slice(&offset.to_be_bytes());
-    TimelineEntry::new(ROOM, position, position, id, reference)
+    ScopedSeqKey::new(ROOM, position, position, id, reference)
 }
 
 fn front_payload(offset: u64) -> Bytes {
@@ -93,7 +93,7 @@ fn sample_ns(iterations: usize, mut operation: impl FnMut()) -> (u128, u128) {
     (samples[0], samples[samples.len() / 2])
 }
 
-fn scan_collection_entries(store: &PackfileStorage) -> Vec<TimelineEntry> {
+fn scan_collection_entries(store: &PackfileStorage) -> Vec<ScopedSeqKey> {
     let scan = store
         .scan_collection(&EVENT_COLLECTION)
         .expect("start event collection scan");
@@ -126,9 +126,9 @@ fn scan_collection_room_filter_count(store: &PackfileStorage) -> usize {
 /// sort is O(N log N) work that the scan path does not necessarily perform.
 fn scan_collection_page(
     store: &PackfileStorage,
-    cursor: TimelineEntry,
+    cursor: ScopedSeqKey,
     limit: usize,
-) -> Vec<TimelineEntry> {
+) -> Vec<ScopedSeqKey> {
     let mut entries = scan_collection_entries(store);
     entries.sort_unstable();
     let start = entries.partition_point(|candidate| *candidate <= cursor);
@@ -157,7 +157,7 @@ fn run(n: usize, batch: usize) {
     let dir = root().join(format!("mtxdb_timeline_{}_{}", std::process::id(), n));
     let _ = std::fs::remove_dir_all(&dir);
     let store = PackfileStorage::open(dir.clone()).expect("open store");
-    let index = TimelineIndex::open(&store, "bench-room-timeline");
+    let index = OrderedIndex::<_, ScopedSeqKey>::open(&store, "bench-room-timeline");
     let mut append_us = 0u128;
     let mut event_write_us = 0u128;
 
@@ -245,7 +245,7 @@ fn run(n: usize, batch: usize) {
     // A key below every stored entry makes reverse_start return None only after
     // the root manifest has been fetched and decoded, so this prices the O(L)
     // manifest step without reading any leaf.
-    let below = TimelineEntry::new(ROOM, i64::MIN, i64::MIN, [0u8; 16], [0u8; 32]);
+    let below = ScopedSeqKey::new(ROOM, i64::MIN, i64::MIN, [0u8; 16], [0u8; 32]);
     let below_cursor = index
         .cursor(root_id, below)
         .expect("valid timeline cursor geometry");
@@ -286,7 +286,7 @@ fn run(n: usize, batch: usize) {
     drop(index);
     drop(store);
     let reopened = PackfileStorage::open(dir.clone()).expect("reopen store");
-    let reopened_index = TimelineIndex::open(&reopened, "bench-room-timeline");
+    let reopened_index = OrderedIndex::<_, ScopedSeqKey>::open(&reopened, "bench-room-timeline");
     let t = Instant::now();
     black_box(
         reopened_index
@@ -369,7 +369,7 @@ fn run(n: usize, batch: usize) {
     let batch_max_ns = *batch_samples.last().expect("tail batch samples");
     println!(
         "timeline_tail_publish n={n} leaves_before~{} payload_seed_records={tail_total} payload_seed_us={tail_payload_seed_us} single_entries={} single_first_ns={single_first_ns} single_min_ns={} single_median_ns={} single_max_ns={single_max_ns} batch_entries={} batch_count={} batch_first_ns={batch_first_ns} batch_min_ns={} batch_median_ns={} batch_max_ns={batch_max_ns}",
-        n.div_ceil(TIMELINE_LEAF_CAP),
+        n.div_ceil(ORDERED_LEAF_CAP),
         SINGLE_TAIL_WRITES,
         single_samples[0],
         single_samples[single_samples.len() / 2],
@@ -445,7 +445,7 @@ fn run(n: usize, batch: usize) {
     let front_batch_max_ns = *front_batch_samples.last().expect("front batch samples");
     println!(
         "timeline_front_publish n={n} leaves_before~{} payload_seed_records={tail_total} payload_seed_us={front_payload_seed_us} single_entries={} single_first_ns={front_single_first_ns} single_min_ns={} single_median_ns={} single_max_ns={front_single_max_ns} batch_entries={} batch_count={} batch_first_ns={front_batch_first_ns} batch_min_ns={} batch_median_ns={} batch_max_ns={front_batch_max_ns}",
-        n.div_ceil(TIMELINE_LEAF_CAP),
+        n.div_ceil(ORDERED_LEAF_CAP),
         SINGLE_TAIL_WRITES,
         front_single_samples[0],
         front_single_samples[front_single_samples.len() / 2],

@@ -4,8 +4,8 @@
 //! answer a range read over an ordered scope. This module adds a **derived**
 //! ordered index built from ordinary records, in the same spirit as
 //! [`crate::auxiliary::AuxiliaryIndex`]: it is rebuildable, packfiles stay
-//! authoritative, and event payloads are never duplicated — a leaf stores only
-//! the ordering key plus the event's node id; the caller fetches the payload.
+//! authoritative, and record payloads are never duplicated — a leaf stores only
+//! the ordering key plus the record's node id; the caller fetches the payload.
 //!
 //! The persisted key is the total order
 //!
@@ -23,15 +23,15 @@
 //! are not stable.
 //!
 //! Layout (all content-addressed, immutable except the head):
-//! - **leaf** (`TMLF`): up to [`crate::ordered_index::TIMELINE_LEAF_CAP`] sorted entries;
-//! - **directory** (`TMLD`): up to [`crate::ordered_index::TIMELINE_DIRECTORY_FANOUT`] leaf
+//! - **leaf** (`TMLF`): up to [`crate::ordered_index::ORDERED_LEAF_CAP`] sorted entries;
+//! - **directory** (`TMLD`): up to [`crate::ordered_index::ORDERED_DIRECTORY_FANOUT`] leaf
 //!   descriptors with minimum, maximum, and entry count;
 //! - **root** (`TMLR`): an ordered directory manifest plus total entry count;
 //! - **head** (`TMLH`): a fixed-id record holding the current root id, the only
 //!   mutable id (last write wins).
 //!
 //! A rebuild writes new leaves and a new root and then swaps the head; old
-//! records survive until GC, so a [`TimelineCursor`] that pins the root it
+//! records survive until GC, so an [`OrderedCursor`] that pins the root it
 //! started on keeps paginating that snapshot even after an update. Forward
 //! paging returns keys strictly greater than the cursor, reverse strictly less,
 //! so resuming is exact and idempotent in both directions.
@@ -51,33 +51,31 @@ use crate::template::{
     COLLECTION_METADATA_RECORD_ID, MEMBER_NAMESPACE_ORDX,
 };
 
-/// Version byte for timeline records and cursors.
-pub const TIMELINE_FORMAT_VERSION: u8 = 0x01;
+/// Version byte for ordered-index records and cursors.
+pub const ORDERED_FORMAT_VERSION: u8 = 0x01;
 /// Maximum entries per leaf record.
-pub const TIMELINE_LEAF_CAP: usize = 64;
+pub const ORDERED_LEAF_CAP: usize = 64;
 /// Maximum leaf descriptors per directory record.
-pub const TIMELINE_DIRECTORY_FANOUT: usize = 16;
+pub const ORDERED_DIRECTORY_FANOUT: usize = 16;
 
 /// Magic prefix of a leaf record (`b"TMLF"`).
-pub const TIMELINE_LEAF_MAGIC: [u8; 4] = *b"TMLF";
+pub const ORDERED_LEAF_MAGIC: [u8; 4] = *b"TMLF";
 /// Magic prefix of a root manifest record (`b"TMLR"`).
-pub const TIMELINE_ROOT_MAGIC: [u8; 4] = *b"TMLR";
+pub const ORDERED_ROOT_MAGIC: [u8; 4] = *b"TMLR";
 /// Magic prefix of a directory record (`b"TMLD"`).
-pub const TIMELINE_DIRECTORY_MAGIC: [u8; 4] = *b"TMLD";
+pub const ORDERED_DIRECTORY_MAGIC: [u8; 4] = *b"TMLD";
 /// Magic prefix of the head record (`b"TMLH"`).
-pub const TIMELINE_HEAD_MAGIC: [u8; 4] = *b"TMLH";
+pub const ORDERED_HEAD_MAGIC: [u8; 4] = *b"TMLH";
 /// Magic prefix of a buffered snapshot record (`b"TMLS"`).
-pub const TIMELINE_SNAPSHOT_MAGIC: [u8; 4] = *b"TMLS";
+pub const ORDERED_SNAPSHOT_MAGIC: [u8; 4] = *b"TMLS";
 /// Magic prefix of an opaque cursor (`b"TMLC"`).
-pub const TIMELINE_CURSOR_MAGIC: [u8; 4] = *b"TMLC";
+pub const ORDERED_CURSOR_MAGIC: [u8; 4] = *b"TMLC";
 
 /// Reserved node id of the head record (the only mutable id in the index).
-pub const TIMELINE_HEAD_ID: NodeId = *b"MTXD-TML-HEAD-v1";
+pub const ORDERED_HEAD_ID: NodeId = *b"MTXD-TML-HEAD-v1";
 
 /// A fixed-width final tie-break component of an ordered key.
 pub type KeyTag = [u8; 32];
-/// Compatibility alias for timeline callers that used event references.
-pub type EventRef = KeyTag;
 
 #[cfg(test)]
 const ENTRY_LEN: usize = 16 + 8 + 8 + 16 + 32;
@@ -94,12 +92,12 @@ const CURSOR_FIXED_LEN: usize = 49;
 const HEAD_LEN: usize = ROOT_FIXED_LEN;
 #[cfg(test)]
 const CURSOR_LEN: usize = CURSOR_FIXED_LEN + ENTRY_LEN;
-const LEAF_FORMAT_VERSION: u8 = TIMELINE_FORMAT_VERSION;
-const ROOT_FORMAT_VERSION: u8 = TIMELINE_FORMAT_VERSION;
-const SNAPSHOT_FORMAT_VERSION: u8 = TIMELINE_FORMAT_VERSION;
-const DIRECTORY_FORMAT_VERSION: u8 = TIMELINE_FORMAT_VERSION;
-const HEAD_FORMAT_VERSION: u8 = TIMELINE_FORMAT_VERSION;
-const CURSOR_FORMAT_VERSION: u8 = TIMELINE_FORMAT_VERSION;
+const LEAF_FORMAT_VERSION: u8 = ORDERED_FORMAT_VERSION;
+const ROOT_FORMAT_VERSION: u8 = ORDERED_FORMAT_VERSION;
+const SNAPSHOT_FORMAT_VERSION: u8 = ORDERED_FORMAT_VERSION;
+const DIRECTORY_FORMAT_VERSION: u8 = ORDERED_FORMAT_VERSION;
+const HEAD_FORMAT_VERSION: u8 = ORDERED_FORMAT_VERSION;
+const CURSOR_FORMAT_VERSION: u8 = ORDERED_FORMAT_VERSION;
 
 /// Order-preserving big-endian encoding of a signed position: flipping the
 /// sign bit makes byte order equal numeric order, so the wire key is
@@ -175,9 +173,6 @@ impl ScopedSeqKey {
     }
 }
 
-/// Compatibility alias for the original timeline-specific key name.
-pub type TimelineEntry = ScopedSeqKey;
-
 /// Contract for fixed-width keys whose byte encoding matches their order.
 pub trait OrderedKey: Copy + Ord + Eq {
     /// Leading prefix used to scope a range scan.
@@ -187,9 +182,9 @@ pub trait OrderedKey: Copy + Ord + Eq {
     /// Four-byte schema discriminator mixed into the index domain.
     const SCHEMA_TAG: [u8; 4];
     /// Maximum entries in one leaf record.
-    const LEAF_CAP: usize = TIMELINE_LEAF_CAP;
+    const LEAF_CAP: usize = ORDERED_LEAF_CAP;
     /// Maximum child descriptors in one directory record.
-    const DIR_FANOUT: usize = TIMELINE_DIRECTORY_FANOUT;
+    const DIR_FANOUT: usize = ORDERED_DIRECTORY_FANOUT;
     /// Entries buffered inline in a head snapshot. Set to `0` to disable the
     /// optional head tier for a key type.
     const HEAD_INLINE_CAP: usize = 8;
@@ -218,7 +213,7 @@ type LeafDescriptor<K> = SpanDescriptor<K>;
 type DirectoryDescriptor<K> = SpanDescriptor<K>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct TimelineRoot<K: OrderedKey> {
+struct OrderedRoot<K: OrderedKey> {
     domain: DomainTag,
     height: u8,
     entry_count: u64,
@@ -240,7 +235,7 @@ struct HeadTier {
 /// is a single small record write, so an append does not touch the copy-on-write
 /// tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct TimelineSnapshot<K: OrderedKey> {
+struct OrderedSnapshot<K: OrderedKey> {
     domain: DomainTag,
     base_count: u64,
     base_root_id: NodeId,
@@ -248,7 +243,7 @@ struct TimelineSnapshot<K: OrderedKey> {
     inline: Vec<K>,
 }
 
-impl<K: OrderedKey> TimelineSnapshot<K> {
+impl<K: OrderedKey> OrderedSnapshot<K> {
     fn delta_count(&self) -> Result<u64, StorageError> {
         self.tiers.iter().try_fold(
             u64::try_from(self.inline.len()).unwrap_or(u64::MAX),
@@ -344,7 +339,7 @@ enum TreeMutation<K: OrderedKey> {
     Mutate { remove: Vec<K>, insert: Vec<K> },
 }
 
-trait TimelineTreeIo<K: OrderedKey> {
+trait OrderedTreeIo<K: OrderedKey> {
     fn load_leaf(&mut self, span: &SpanDescriptor<K>) -> Result<Vec<K>, StorageError>;
     fn load_leaf_id(&mut self, id: &NodeId) -> Result<Vec<K>, StorageError>;
     fn load_directory(
@@ -452,7 +447,7 @@ fn split_mode<K: OrderedKey>(
     SplitMode::Interior
 }
 
-fn root_split_mode<K: OrderedKey>(root: &TimelineRoot<K>, entries: &[K]) -> (u8, SplitMode) {
+fn root_split_mode<K: OrderedKey>(root: &OrderedRoot<K>, entries: &[K]) -> (u8, SplitMode) {
     if root.height == 0 {
         return (1, SplitMode::Tail);
     }
@@ -531,7 +526,7 @@ fn append_spans<K: OrderedKey>(
     spans: &[SpanDescriptor<K>],
     level: u8,
     entries: &[K],
-    io: &mut dyn TimelineTreeIo<K>,
+    io: &mut dyn OrderedTreeIo<K>,
     inserted: &mut u64,
 ) -> Result<Vec<SpanDescriptor<K>>, StorageError> {
     if spans.is_empty() {
@@ -628,7 +623,7 @@ fn stage_outside_full_leaf<K: OrderedKey>(
     all_before: bool,
     output: &mut Vec<SpanDescriptor<K>>,
     inserted: &mut u64,
-    io: &mut dyn TimelineTreeIo<K>,
+    io: &mut dyn OrderedTreeIo<K>,
 ) -> Result<(), StorageError> {
     let mut added = Vec::new();
     let mode = if all_before {
@@ -651,7 +646,7 @@ fn stage_outside_full_leaf<K: OrderedKey>(
 
 fn write_leaf_span<K: OrderedKey>(
     entries: &[K],
-    io: &mut dyn TimelineTreeIo<K>,
+    io: &mut dyn OrderedTreeIo<K>,
 ) -> Result<SpanDescriptor<K>, StorageError> {
     let first = *entries
         .first()
@@ -675,7 +670,7 @@ fn remove_spans<K: OrderedKey>(
     spans: &[SpanDescriptor<K>],
     level: u8,
     to_remove: &[K],
-    io: &mut dyn TimelineTreeIo<K>,
+    io: &mut dyn OrderedTreeIo<K>,
     removed: &mut u64,
 ) -> Result<Vec<SpanDescriptor<K>>, StorageError> {
     if spans.is_empty() || to_remove.is_empty() {
@@ -774,7 +769,7 @@ fn purge_prefix_spans<K: OrderedKey>(
     spans: &[SpanDescriptor<K>],
     level: u8,
     prefix: &K::Prefix,
-    io: &mut dyn TimelineTreeIo<K>,
+    io: &mut dyn OrderedTreeIo<K>,
     removed: &mut u64,
 ) -> Result<Vec<SpanDescriptor<K>>, StorageError> {
     let mut output = Vec::with_capacity(spans.len());
@@ -836,7 +831,7 @@ fn purge_prefix_spans<K: OrderedKey>(
 fn demote_spans<K: OrderedKey>(
     mut spans: Vec<SpanDescriptor<K>>,
     mut height: u8,
-    io: &mut dyn TimelineTreeIo<K>,
+    io: &mut dyn OrderedTreeIo<K>,
 ) -> Result<(u8, Vec<SpanDescriptor<K>>), StorageError> {
     if spans.is_empty() {
         return Ok((0, spans));
@@ -878,11 +873,11 @@ fn mutation_count<K: OrderedKey>(
 }
 
 fn apply_staged_mutation<K: OrderedKey>(
-    root: &TimelineRoot<K>,
+    root: &OrderedRoot<K>,
     old_count: u64,
     mutation: TreeMutation<K>,
     domain: DomainTag,
-    io: &mut dyn TimelineTreeIo<K>,
+    io: &mut dyn OrderedTreeIo<K>,
 ) -> Result<AppliedMutation<K>, StorageError> {
     let mut removed = 0_u64;
     let (height, spans, inserted, count) = match mutation {
@@ -920,7 +915,7 @@ fn apply_staged_mutation<K: OrderedKey>(
             )?;
             let (base_height, base_spans) = demote_spans(changed, root.height, io)?;
             let base_count = mutation_count(old_count, removed, &base_spans)?;
-            let base = TimelineRoot {
+            let base = OrderedRoot {
                 domain,
                 height: base_height,
                 entry_count: base_count,
@@ -979,7 +974,7 @@ fn mark_ordered_root<K: OrderedKey>(
         .first()
         .and_then(Option::as_ref)
         .ok_or(StorageError::NotFound(root_id))?;
-    if root_record.bytes.starts_with(&TIMELINE_SNAPSHOT_MAGIC) {
+    if root_record.bytes.starts_with(&ORDERED_SNAPSHOT_MAGIC) {
         let snapshot = decode_snapshot::<K>(&root_record.bytes, domain)?;
         for tier in &snapshot.tiers {
             live.insert(tier.child_id);
@@ -1068,7 +1063,7 @@ fn promote_spans<K: OrderedKey>(
     mut spans: Vec<SpanDescriptor<K>>,
     mut height: u8,
     mode: SplitMode,
-    io: &mut dyn TimelineTreeIo<K>,
+    io: &mut dyn OrderedTreeIo<K>,
 ) -> Result<(u8, Vec<SpanDescriptor<K>>), StorageError> {
     if spans.is_empty() {
         return Ok((0, spans));
@@ -1097,9 +1092,6 @@ pub struct OrderedCursor<K: OrderedKey> {
     root_id: NodeId,
     entry: K,
 }
-
-/// Compatibility alias for the timeline-scoped ordered cursor.
-pub type TimelineCursor = OrderedCursor<ScopedSeqKey>;
 
 impl<K: OrderedKey> OrderedCursor<K> {
     /// Build a cursor for `root_id` at `entry`.
@@ -1145,7 +1137,7 @@ impl<K: OrderedKey> OrderedCursor<K> {
     pub fn encode(&self) -> Vec<u8> {
         let wire_len = CURSOR_FIXED_LEN.saturating_add(K::WIRE_LEN);
         let mut out = Vec::with_capacity(wire_len);
-        out.extend_from_slice(&TIMELINE_CURSOR_MAGIC);
+        out.extend_from_slice(&ORDERED_CURSOR_MAGIC);
         out.push(CURSOR_FORMAT_VERSION);
         out.extend_from_slice(self.domain.as_bytes());
         out.extend_from_slice(&self.schema_tag);
@@ -1163,7 +1155,7 @@ impl<K: OrderedKey> OrderedCursor<K> {
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let wire_len = CURSOR_FIXED_LEN.saturating_add(K::WIRE_LEN);
         if bytes.len() != wire_len
-            || bytes[..4] != TIMELINE_CURSOR_MAGIC
+            || bytes[..4] != ORDERED_CURSOR_MAGIC
             || bytes[4] != CURSOR_FORMAT_VERSION
         {
             return None;
@@ -1186,7 +1178,7 @@ impl<K: OrderedKey> OrderedCursor<K> {
     }
 }
 
-/// One page of a timeline read.
+/// One page of an ordered-index read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderedPage<K: OrderedKey> {
     /// The entries in traversal order.
@@ -1194,9 +1186,6 @@ pub struct OrderedPage<K: OrderedKey> {
     /// Resume token, present when the page filled `limit`.
     pub next_cursor: Option<OrderedCursor<K>>,
 }
-
-/// Compatibility alias for the timeline-scoped ordered page.
-pub type TimelinePage = OrderedPage<ScopedSeqKey>;
 
 /// Derive an ordered-index collection id for a caller-chosen index name.
 #[must_use]
@@ -1207,12 +1196,6 @@ pub fn ordered_collection_id<K: OrderedKey>(name: &str) -> [u8; 16] {
     canonical.push(b':');
     canonical.extend_from_slice(name.as_bytes());
     derive_collection_id(Some(MEMBER_NAMESPACE_ORDX), &canonical)
-}
-
-/// The compatibility collection id for timeline callers.
-#[must_use]
-pub fn timeline_collection_id(name: &str) -> [u8; 16] {
-    ordered_collection_id::<ScopedSeqKey>(name)
 }
 
 fn ordered_domain<K: OrderedKey>(collection_id: &[u8; 16]) -> DomainTag {
@@ -1259,8 +1242,8 @@ fn merge_sorted_unique<K: OrderedKey>(left: &[K], right: &[K]) -> Vec<K> {
 }
 
 fn load_snapshot_tiers<K: OrderedKey>(
-    snapshot: &TimelineSnapshot<K>,
-    io: &mut dyn TimelineTreeIo<K>,
+    snapshot: &OrderedSnapshot<K>,
+    io: &mut dyn OrderedTreeIo<K>,
 ) -> Result<Vec<(u8, Vec<K>)>, StorageError> {
     let mut tiers = Vec::with_capacity(snapshot.tiers.len());
     for tier in &snapshot.tiers {
@@ -1277,8 +1260,8 @@ fn load_snapshot_tiers<K: OrderedKey>(
 
 /// All buffered keys in a snapshot, sorted and deduplicated.
 fn snapshot_delta<K: OrderedKey>(
-    snapshot: &TimelineSnapshot<K>,
-    io: &mut dyn TimelineTreeIo<K>,
+    snapshot: &OrderedSnapshot<K>,
+    io: &mut dyn OrderedTreeIo<K>,
 ) -> Result<Vec<K>, StorageError> {
     let mut delta = snapshot.inline.clone();
     for (_, tier) in load_snapshot_tiers(snapshot, io)? {
@@ -1291,7 +1274,7 @@ fn main_contains<K: OrderedKey>(
     spans: &[SpanDescriptor<K>],
     level: u8,
     key: &K,
-    io: &mut dyn TimelineTreeIo<K>,
+    io: &mut dyn OrderedTreeIo<K>,
 ) -> Result<bool, StorageError> {
     let position = spans.partition_point(|span| span.min_entry <= *key);
     let Some(span) = position.checked_sub(1).and_then(|index| spans.get(index)) else {
@@ -1312,8 +1295,8 @@ fn main_contains<K: OrderedKey>(
 /// no-op instead of publishing a duplicate delta entry.
 fn drop_base_duplicates<K: OrderedKey>(
     keys: &mut Vec<K>,
-    root: &TimelineRoot<K>,
-    io: &mut dyn TimelineTreeIo<K>,
+    root: &OrderedRoot<K>,
+    io: &mut dyn OrderedTreeIo<K>,
 ) -> Result<(), StorageError> {
     if root.directories.is_empty() {
         return Ok(());
@@ -1329,8 +1312,8 @@ fn drop_base_duplicates<K: OrderedKey>(
     Ok(())
 }
 
-fn empty_root<K: OrderedKey>(domain: DomainTag) -> TimelineRoot<K> {
-    TimelineRoot {
+fn empty_root<K: OrderedKey>(domain: DomainTag) -> OrderedRoot<K> {
+    OrderedRoot {
         domain,
         height: 0,
         entry_count: 0,
@@ -1347,9 +1330,9 @@ struct AppendPlan {
 }
 
 fn publish_clean_root<K: OrderedKey>(
-    base_root: &TimelineRoot<K>,
+    base_root: &OrderedRoot<K>,
     domain: DomainTag,
-    _io: &mut dyn TimelineTreeIo<K>,
+    _io: &mut dyn OrderedTreeIo<K>,
 ) -> Result<AppendPlan, StorageError> {
     let count = base_root.entry_count;
     let root_payload = encode_root::<K>(&base_root.directories, count, base_root.height, domain)?;
@@ -1362,10 +1345,10 @@ fn publish_clean_root<K: OrderedKey>(
 }
 
 fn publish_flushed<K: OrderedKey>(
-    base_root: &TimelineRoot<K>,
+    base_root: &OrderedRoot<K>,
     delta: &[K],
     domain: DomainTag,
-    io: &mut dyn TimelineTreeIo<K>,
+    io: &mut dyn OrderedTreeIo<K>,
 ) -> Result<AppendPlan, StorageError> {
     if delta.is_empty() {
         if base_root.directories.is_empty() {
@@ -1401,16 +1384,16 @@ fn publish_flushed<K: OrderedKey>(
 }
 
 fn publish_snapshot<K: OrderedKey>(
-    snapshot: Option<&TimelineSnapshot<K>>,
+    snapshot: Option<&OrderedSnapshot<K>>,
     base_count: u64,
     base_root_id: NodeId,
     inline: Vec<K>,
     tiers: &[Option<Vec<K>>; 2],
     domain: DomainTag,
-    io: &mut dyn TimelineTreeIo<K>,
+    io: &mut dyn OrderedTreeIo<K>,
 ) -> Result<AppendPlan, StorageError> {
     let existing = load_snapshot_tiers(
-        snapshot.unwrap_or(&TimelineSnapshot {
+        snapshot.unwrap_or(&OrderedSnapshot {
             domain,
             base_count: 0,
             base_root_id: [0u8; 16],
@@ -1456,7 +1439,7 @@ fn publish_snapshot<K: OrderedKey>(
             entry_count,
         });
     }
-    let snapshot = TimelineSnapshot {
+    let snapshot = OrderedSnapshot {
         domain,
         base_count,
         base_root_id: if base_count == 0 {
@@ -1485,12 +1468,12 @@ fn publish_snapshot<K: OrderedKey>(
 }
 
 fn plan_append<K: OrderedKey>(
-    snapshot: Option<&TimelineSnapshot<K>>,
-    base_root: &TimelineRoot<K>,
+    snapshot: Option<&OrderedSnapshot<K>>,
+    base_root: &OrderedRoot<K>,
     base_root_id: NodeId,
     pending: &[K],
     domain: DomainTag,
-    io: &mut dyn TimelineTreeIo<K>,
+    io: &mut dyn OrderedTreeIo<K>,
 ) -> Result<AppendPlan, StorageError> {
     let use_buffer = K::HEAD_INLINE_CAP > 0 && pending.len() < K::LEAF_CAP;
     if !use_buffer {
@@ -1564,8 +1547,8 @@ fn plan_append<K: OrderedKey>(
 }
 
 struct HeadSnapshotState<K: OrderedKey> {
-    snapshot: Option<TimelineSnapshot<K>>,
-    base_root: TimelineRoot<K>,
+    snapshot: Option<OrderedSnapshot<K>>,
+    base_root: OrderedRoot<K>,
     base_root_id: NodeId,
 }
 
@@ -1588,7 +1571,7 @@ fn decode_head_state<K: OrderedKey>(
             base_root_id: [0u8; 16],
         });
     };
-    if bytes.starts_with(&TIMELINE_SNAPSHOT_MAGIC) {
+    if bytes.starts_with(&ORDERED_SNAPSHOT_MAGIC) {
         let snapshot = decode_snapshot::<K>(bytes, domain)?;
         let base_root = if snapshot.base_count == 0 {
             empty_root(domain)
@@ -1635,10 +1618,10 @@ fn decode_head_state<K: OrderedKey>(
 }
 
 fn fold_snapshot_delta<K: OrderedKey>(
-    snapshot: Option<&TimelineSnapshot<K>>,
-    base_root: &TimelineRoot<K>,
-    io: &mut dyn TimelineTreeIo<K>,
-) -> Result<TimelineRoot<K>, StorageError> {
+    snapshot: Option<&OrderedSnapshot<K>>,
+    base_root: &OrderedRoot<K>,
+    io: &mut dyn OrderedTreeIo<K>,
+) -> Result<OrderedRoot<K>, StorageError> {
     let Some(snapshot) = snapshot else {
         return Ok(base_root.clone());
     };
@@ -1656,7 +1639,7 @@ fn fold_snapshot_delta<K: OrderedKey>(
         &mut inserted,
     )?;
     let (height, directories) = promote_spans(spans, start_height, mode, io)?;
-    Ok(TimelineRoot {
+    Ok(OrderedRoot {
         domain: base_root.domain,
         height,
         entry_count: base_root
@@ -1796,9 +1779,6 @@ pub struct OrderedIndex<'a, S: StorageEngine + ?Sized, K: OrderedKey> {
     domain: DomainTag,
     _key: std::marker::PhantomData<K>,
 }
-
-/// Compatibility alias for the original ordered timeline index API.
-pub type TimelineIndex<'a, S> = OrderedIndex<'a, S, ScopedSeqKey>;
 
 impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
     /// Open (or create) the named ordered index.
@@ -1943,7 +1923,7 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         let root_id = content_id(&root_payload);
         self.write_record(&root_id, root_payload)?;
         self.write_record(
-            &TIMELINE_HEAD_ID,
+            &ORDERED_HEAD_ID,
             encode_head::<K>(&root_id, count, self.domain)?,
         )?;
         Ok(root_id)
@@ -2017,7 +1997,7 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         let (head_records, collection_version) = transaction.get_with_collection_version(
             pool,
             &self.collection_id,
-            &[TIMELINE_HEAD_ID],
+            &[ORDERED_HEAD_ID],
         )?;
         let head_record = head_records.first().ok_or_else(|| {
             StorageError::Internal("timeline head read returned no slot".to_owned())
@@ -2106,7 +2086,7 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         self.stage_record(
             transaction,
             pool,
-            &TIMELINE_HEAD_ID,
+            &ORDERED_HEAD_ID,
             encode_head::<K>(&next_head_id, plan.count, self.domain)?,
         )?;
         Ok(next_head_id)
@@ -2178,7 +2158,7 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         }
         if next_head_id != head_id {
             self.write_record(
-                &TIMELINE_HEAD_ID,
+                &ORDERED_HEAD_ID,
                 encode_head::<K>(&next_head_id, plan.count, self.domain)?,
             )?;
         }
@@ -2243,14 +2223,14 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         let (head_records, collection_version) = transaction.get_with_collection_version(
             pool,
             &self.collection_id,
-            &[TIMELINE_HEAD_ID],
+            &[ORDERED_HEAD_ID],
         )?;
         let head = head_records.first().ok_or_else(|| {
             StorageError::Internal("ordered head read returned no slot".to_owned())
         })?;
         let mut live = std::collections::HashSet::new();
         live.insert(COLLECTION_METADATA_RECORD_ID);
-        live.insert(TIMELINE_HEAD_ID);
+        live.insert(ORDERED_HEAD_ID);
         let mut roots = pinned_roots.to_vec();
         if let Some(head) = head {
             let (root_id, _) = decode_head::<K>(&head.bytes, self.domain)?;
@@ -2354,7 +2334,7 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         let (head_records, collection_version) = transaction.get_with_collection_version(
             pool,
             &self.collection_id,
-            &[TIMELINE_HEAD_ID],
+            &[ORDERED_HEAD_ID],
         )?;
         let head = head_records.first().ok_or_else(|| {
             StorageError::Internal("ordered head read returned no slot".to_owned())
@@ -2437,7 +2417,7 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         self.stage_record(
             transaction,
             pool,
-            &TIMELINE_HEAD_ID,
+            &ORDERED_HEAD_ID,
             encode_head::<K>(&root_id, count, self.domain)?,
         )?;
         Ok((root_id, removed))
@@ -2503,7 +2483,7 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         let root_id = content_id(&root_payload);
         self.write_record(&root_id, root_payload)?;
         self.write_record(
-            &TIMELINE_HEAD_ID,
+            &ORDERED_HEAD_ID,
             encode_head::<K>(&root_id, count, self.domain)?,
         )?;
         Ok((root_id, removed))
@@ -2536,7 +2516,7 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
     /// # Errors
     /// [`StorageError::Corrupt`] if the head record does not decode.
     pub fn head(&self) -> Result<Option<(NodeId, u64)>, StorageError> {
-        match self.engine.get(&self.collection_id, &TIMELINE_HEAD_ID)? {
+        match self.engine.get(&self.collection_id, &ORDERED_HEAD_ID)? {
             None => Ok(None),
             Some(data) => decode_head::<K>(&data.bytes, self.domain).map(Some),
         }
@@ -2903,7 +2883,7 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
         decode_leaf::<K>(&bytes.bytes)
     }
 
-    fn load_snapshot_delta(&self, snapshot: &TimelineSnapshot<K>) -> Result<Vec<K>, StorageError> {
+    fn load_snapshot_delta(&self, snapshot: &OrderedSnapshot<K>) -> Result<Vec<K>, StorageError> {
         let mut delta = snapshot.inline.clone();
         for tier in &snapshot.tiers {
             let entries = self.load_leaf(&tier.child_id)?;
@@ -2920,12 +2900,12 @@ impl<'a, S: StorageEngine + ?Sized, K: OrderedKey> OrderedIndex<'a, S, K> {
     fn resolve_page_head(
         &self,
         snapshot_root: NodeId,
-    ) -> Result<(TimelineRoot<K>, Option<TimelineSnapshot<K>>), StorageError> {
+    ) -> Result<(OrderedRoot<K>, Option<OrderedSnapshot<K>>), StorageError> {
         let head_bytes = self
             .engine
             .get(&self.collection_id, &snapshot_root)?
             .ok_or(StorageError::NotFound(snapshot_root))?;
-        if !head_bytes.bytes.starts_with(&TIMELINE_SNAPSHOT_MAGIC) {
+        if !head_bytes.bytes.starts_with(&ORDERED_SNAPSHOT_MAGIC) {
             return Ok((decode_root::<K>(&head_bytes.bytes, self.domain)?, None));
         }
         let snapshot = decode_snapshot::<K>(&head_bytes.bytes, self.domain)?;
@@ -3013,7 +2993,7 @@ struct DirectTimelineTreeIo<'index, 'engine, S: StorageEngine + ?Sized, K: Order
     index: &'index OrderedIndex<'engine, S, K>,
 }
 
-impl<S: StorageEngine + ?Sized, K: OrderedKey> TimelineTreeIo<K>
+impl<S: StorageEngine + ?Sized, K: OrderedKey> OrderedTreeIo<K>
     for DirectTimelineTreeIo<'_, '_, S, K>
 {
     fn load_leaf(&mut self, span: &SpanDescriptor<K>) -> Result<Vec<K>, StorageError> {
@@ -3055,7 +3035,7 @@ struct TransactionTimelineTreeIo<
     staged: &'tx mut StagedTree,
 }
 
-impl<S: StorageEngine + ?Sized, K: OrderedKey> TimelineTreeIo<K>
+impl<S: StorageEngine + ?Sized, K: OrderedKey> OrderedTreeIo<K>
     for TransactionTimelineTreeIo<'_, '_, '_, '_, S, K>
 {
     fn load_leaf_id(&mut self, id: &NodeId) -> Result<Vec<K>, StorageError> {
@@ -3285,7 +3265,7 @@ fn encode_leaf<K: OrderedKey>(entries: &[K]) -> Result<Vec<u8>, StorageError> {
         .and_then(|len| len.checked_add(LEAF_HEADER_LEN))
         .ok_or_else(|| StorageError::Internal("ordered leaf length overflow".to_owned()))?;
     let mut out = Vec::with_capacity(capacity);
-    out.extend_from_slice(&TIMELINE_LEAF_MAGIC);
+    out.extend_from_slice(&ORDERED_LEAF_MAGIC);
     out.push(LEAF_FORMAT_VERSION);
     out.extend_from_slice(&count.to_be_bytes());
     let mut previous = None;
@@ -3299,7 +3279,7 @@ fn encode_leaf<K: OrderedKey>(entries: &[K]) -> Result<Vec<u8>, StorageError> {
 fn decode_leaf<K: OrderedKey>(bytes: &[u8]) -> Result<Vec<K>, StorageError> {
     validate_geometry::<K>()?;
     if bytes.len() < LEAF_HEADER_LEN
-        || bytes[..4] != TIMELINE_LEAF_MAGIC
+        || bytes[..4] != ORDERED_LEAF_MAGIC
         || bytes[4] != LEAF_FORMAT_VERSION
     {
         return Err(StorageError::Corrupt("timeline leaf header".to_owned()));
@@ -3340,7 +3320,7 @@ fn encode_directory<K: OrderedKey>(
     let span_count = u16::try_from(spans.len())
         .map_err(|_| StorageError::Internal("timeline directory exceeds u16 spans".to_owned()))?;
     let mut out = Vec::new();
-    out.extend_from_slice(&TIMELINE_DIRECTORY_MAGIC);
+    out.extend_from_slice(&ORDERED_DIRECTORY_MAGIC);
     out.push(DIRECTORY_FORMAT_VERSION);
     out.push(level);
     out.extend_from_slice(&span_count.to_be_bytes());
@@ -3357,7 +3337,7 @@ fn decode_directory<K: OrderedKey>(
 ) -> Result<Vec<SpanDescriptor<K>>, StorageError> {
     validate_geometry::<K>()?;
     if bytes.len() < DIRECTORY_HEADER_LEN
-        || bytes[..4] != TIMELINE_DIRECTORY_MAGIC
+        || bytes[..4] != ORDERED_DIRECTORY_MAGIC
         || bytes[4] != DIRECTORY_FORMAT_VERSION
     {
         return Err(StorageError::Corrupt(
@@ -3472,7 +3452,7 @@ fn encode_root<K: OrderedKey>(
         ));
     }
     let mut out = Vec::new();
-    out.extend_from_slice(&TIMELINE_ROOT_MAGIC);
+    out.extend_from_slice(&ORDERED_ROOT_MAGIC);
     out.push(ROOT_FORMAT_VERSION);
     out.push(height);
     out.extend_from_slice(domain.as_bytes());
@@ -3502,7 +3482,7 @@ fn decode_root_header<K: OrderedKey>(
 ) -> Result<(u8, DomainTag, u64, usize), StorageError> {
     validate_geometry::<K>()?;
     if bytes.len() < ROOT_HEADER_LEN
-        || bytes[..4] != TIMELINE_ROOT_MAGIC
+        || bytes[..4] != ORDERED_ROOT_MAGIC
         || bytes[4] != ROOT_FORMAT_VERSION
     {
         return Err(StorageError::Corrupt("timeline root header".to_owned()));
@@ -3599,7 +3579,7 @@ fn decode_root_spans<K: OrderedKey>(
 fn decode_root<K: OrderedKey>(
     bytes: &[u8],
     expected_domain: DomainTag,
-) -> Result<TimelineRoot<K>, StorageError> {
+) -> Result<OrderedRoot<K>, StorageError> {
     let (height, domain, entry_count, directory_count) =
         decode_root_header::<K>(bytes, expected_domain)?;
     if directory_count > bytes.len() {
@@ -3612,7 +3592,7 @@ fn decode_root<K: OrderedKey>(
     if (height == 0) != directories.is_empty() {
         return Err(StorageError::Corrupt("timeline root height".to_owned()));
     }
-    Ok(TimelineRoot {
+    Ok(OrderedRoot {
         domain,
         height,
         entry_count,
@@ -3620,7 +3600,7 @@ fn decode_root<K: OrderedKey>(
     })
 }
 fn encode_snapshot<K: OrderedKey>(
-    snapshot: &TimelineSnapshot<K>,
+    snapshot: &OrderedSnapshot<K>,
     domain: DomainTag,
 ) -> Result<Vec<u8>, StorageError> {
     validate_geometry::<K>()?;
@@ -3676,7 +3656,7 @@ fn encode_snapshot<K: OrderedKey>(
     let inline_count = u16::try_from(snapshot.inline.len())
         .map_err(|_| StorageError::Internal("timeline snapshot inline count".to_owned()))?;
     let mut out = Vec::new();
-    out.extend_from_slice(&TIMELINE_SNAPSHOT_MAGIC);
+    out.extend_from_slice(&ORDERED_SNAPSHOT_MAGIC);
     out.push(SNAPSHOT_FORMAT_VERSION);
     out.extend_from_slice(domain.as_bytes());
     out.extend_from_slice(&K::SCHEMA_TAG);
@@ -3718,7 +3698,7 @@ fn decode_snapshot_header<K: OrderedKey>(
 ) -> Result<(DomainTag, u64, NodeId, usize, usize), StorageError> {
     validate_geometry::<K>()?;
     if bytes.len() < SNAPSHOT_HEADER_LEN
-        || bytes[..4] != TIMELINE_SNAPSHOT_MAGIC
+        || bytes[..4] != ORDERED_SNAPSHOT_MAGIC
         || bytes[4] != SNAPSHOT_FORMAT_VERSION
     {
         return Err(StorageError::Corrupt("timeline snapshot header".to_owned()));
@@ -3842,7 +3822,7 @@ fn decode_snapshot_inline<K: OrderedKey>(
 fn decode_snapshot<K: OrderedKey>(
     bytes: &[u8],
     expected_domain: DomainTag,
-) -> Result<TimelineSnapshot<K>, StorageError> {
+) -> Result<OrderedSnapshot<K>, StorageError> {
     let (domain, base_count, base_root_id, tier_count, inline_count) =
         decode_snapshot_header::<K>(bytes, expected_domain)?;
     let mut offset = SNAPSHOT_HEADER_LEN;
@@ -3853,7 +3833,7 @@ fn decode_snapshot<K: OrderedKey>(
             "timeline snapshot trailing bytes".to_owned(),
         ));
     }
-    let snapshot = TimelineSnapshot {
+    let snapshot = OrderedSnapshot {
         domain,
         base_count,
         base_root_id,
@@ -3875,7 +3855,7 @@ fn encode_head<K: OrderedKey>(
 ) -> Result<Vec<u8>, StorageError> {
     validate_geometry::<K>()?;
     let mut out = Vec::with_capacity(HEAD_LEN);
-    out.extend_from_slice(&TIMELINE_HEAD_MAGIC);
+    out.extend_from_slice(&ORDERED_HEAD_MAGIC);
     out.push(HEAD_FORMAT_VERSION);
     out.extend_from_slice(domain.as_bytes());
     out.extend_from_slice(&K::SCHEMA_TAG);
@@ -3900,7 +3880,7 @@ fn decode_head<K: OrderedKey>(
 ) -> Result<(NodeId, u64), StorageError> {
     validate_geometry::<K>()?;
     if bytes.len() != HEAD_LEN
-        || bytes[..4] != TIMELINE_HEAD_MAGIC
+        || bytes[..4] != ORDERED_HEAD_MAGIC
         || bytes[4] != HEAD_FORMAT_VERSION
     {
         return Err(StorageError::Corrupt("timeline head".to_owned()));

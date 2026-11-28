@@ -251,9 +251,8 @@ pub use matrix_policy::{
     ReferenceHashInputPolicy, RoomIdPolicy, RoomMetadata, StateResolutionPolicy,
 };
 pub use ordered_index::{
-    ordered_collection_id, timeline_collection_id, EventRef, KeyTag, OrderedCursor, OrderedIndex,
-    OrderedKey, OrderedPage, ScopedSeqKey, TimelineCursor, TimelineEntry, TimelineIndex,
-    TimelinePage, TIMELINE_FORMAT_VERSION, TIMELINE_LEAF_CAP,
+    ordered_collection_id, KeyTag, OrderedCursor, OrderedIndex, OrderedKey, OrderedPage,
+    ScopedSeqKey, ORDERED_FORMAT_VERSION, ORDERED_LEAF_CAP,
 };
 pub use packfile::{
     storage::{OperationLatency, PackfileStorage, ReadPlanPolicy},

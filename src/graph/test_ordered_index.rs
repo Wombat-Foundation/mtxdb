@@ -4,27 +4,29 @@ use crate::layout::ShardType;
 use crate::storage::{InMemoryStorage, StorageEngine};
 use std::path::PathBuf;
 
+type SeqIndex<'a, S> = OrderedIndex<'a, S, ScopedSeqKey>;
+
 fn test_root(name: &str) -> PathBuf {
     let path =
-        crate::test_scratch::root().join(format!("mtxdb-timeline-{name}-{}", std::process::id()));
+        crate::test_scratch::root().join(format!("mtxdb-ordered-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     path
 }
 
-fn entry(room_id: [u8; 16], order: i64, seed: u8) -> TimelineEntry {
+fn entry(room_id: [u8; 16], order: i64, seed: u8) -> ScopedSeqKey {
     let mut node_id = [0u8; 16];
     node_id[0] = seed;
     node_id[15] = 0x11;
     let mut event_ref = [0u8; 32];
     event_ref[0] = seed;
-    TimelineEntry::new(room_id, order, i64::from(seed), node_id, event_ref)
+    ScopedSeqKey::new(room_id, order, i64::from(seed), node_id, event_ref)
 }
 
 fn span(
-    min_entry: TimelineEntry,
-    max_entry: TimelineEntry,
+    min_entry: ScopedSeqKey,
+    max_entry: ScopedSeqKey,
     entry_count: u64,
-) -> SpanDescriptor<TimelineEntry> {
+) -> SpanDescriptor<ScopedSeqKey> {
     SpanDescriptor {
         min_entry,
         max_entry,
@@ -33,8 +35,8 @@ fn span(
     }
 }
 
-fn sorted_reference(entries: &[TimelineEntry], room_id: &[u8; 16]) -> Vec<TimelineEntry> {
-    let mut reference: Vec<TimelineEntry> = entries
+fn sorted_reference(entries: &[ScopedSeqKey], room_id: &[u8; 16]) -> Vec<ScopedSeqKey> {
+    let mut reference: Vec<ScopedSeqKey> = entries
         .iter()
         .filter(|entry| entry.scope == *room_id)
         .copied()
@@ -45,13 +47,13 @@ fn sorted_reference(entries: &[TimelineEntry], room_id: &[u8; 16]) -> Vec<Timeli
 }
 
 fn collect<S: StorageEngine + ?Sized>(
-    index: &TimelineIndex<'_, S>,
+    index: &SeqIndex<'_, S>,
     room_id: &[u8; 16],
     forward: bool,
     limit: usize,
-) -> Vec<TimelineEntry> {
+) -> Vec<ScopedSeqKey> {
     let mut all = Vec::new();
-    let mut cursor: Option<TimelineCursor> = None;
+    let mut cursor: Option<OrderedCursor<ScopedSeqKey>> = None;
     loop {
         let page = index
             .page(room_id, cursor.as_ref(), forward, limit)
@@ -71,15 +73,18 @@ fn collect<S: StorageEngine + ?Sized>(
 #[test]
 fn cursor_encoding_roundtrips() {
     let entry = entry([1u8; 16], 7, 3);
-    let cursor = TimelineCursor::new([0xAB; 16], entry, DomainTag::new([0xCD; 16]))
+    let cursor = OrderedCursor::<ScopedSeqKey>::new([0xAB; 16], entry, DomainTag::new([0xCD; 16]))
         .expect("valid timeline cursor geometry");
     let bytes = cursor.encode();
     assert_eq!(bytes.len(), CURSOR_LEN);
-    assert_eq!(TimelineCursor::decode(&bytes), Some(cursor));
-    assert_eq!(TimelineCursor::decode(&bytes[..bytes.len() - 1]), None);
+    assert_eq!(OrderedCursor::<ScopedSeqKey>::decode(&bytes), Some(cursor));
+    assert_eq!(
+        OrderedCursor::<ScopedSeqKey>::decode(&bytes[..bytes.len() - 1]),
+        None
+    );
     let mut corrupt = bytes;
     corrupt[0] ^= 0xff;
-    assert_eq!(TimelineCursor::decode(&corrupt), None);
+    assert_eq!(OrderedCursor::<ScopedSeqKey>::decode(&corrupt), None);
 }
 
 #[test]
@@ -163,15 +168,15 @@ fn with_collection_id_uses_the_supplied_id() {
     let engine = InMemoryStorage::new();
     let name = "test";
     let supplied = [0xAB; 16];
-    assert_ne!(supplied, timeline_collection_id(name));
-    let index = TimelineIndex::with_collection_id(&engine, name, supplied);
+    assert_ne!(supplied, ordered_collection_id::<ScopedSeqKey>(name));
+    let index = SeqIndex::with_collection_id(&engine, name, supplied);
     assert_eq!(index.collection_id(), supplied);
 }
 
 #[test]
 fn forward_pages_cover_a_room_in_order() {
     let engine = InMemoryStorage::new();
-    let index = TimelineIndex::open(&engine, String::from("test"));
+    let index = SeqIndex::open(&engine, String::from("test"));
     let mut entries = Vec::new();
     for seed in 0..40u8 {
         entries.push(entry([1u8; 16], i64::from(seed / 2), seed));
@@ -187,7 +192,7 @@ fn forward_pages_cover_a_room_in_order() {
 #[test]
 fn reverse_pages_are_forward_reversed() {
     let engine = InMemoryStorage::new();
-    let index = TimelineIndex::open(&engine, "test");
+    let index = SeqIndex::open(&engine, "test");
     let mut entries = Vec::new();
     for seed in 0..37u8 {
         entries.push(entry([1u8; 16], i64::from(seed), seed));
@@ -204,7 +209,7 @@ fn reverse_pages_are_forward_reversed() {
 #[test]
 fn count_range_uses_subtree_counts_and_includes_buffered_entries() {
     let engine = InMemoryStorage::new();
-    let index = TimelineIndex::open(&engine, "count_range");
+    let index = SeqIndex::open(&engine, "count_range");
     let scope = [0x41; 16];
     let other_scope = [0x42; 16];
     let entries: Vec<_> = (0..1_200_i64)
@@ -311,8 +316,8 @@ fn count_range_uses_subtree_counts_and_includes_buffered_entries() {
 #[test]
 fn cursor_pins_its_snapshot_across_a_rebuild() {
     let engine = InMemoryStorage::new();
-    let index = TimelineIndex::open(&engine, "test");
-    let first: Vec<TimelineEntry> = (0..10u8)
+    let index = SeqIndex::open(&engine, "test");
+    let first: Vec<ScopedSeqKey> = (0..10u8)
         .map(|seed| entry([1u8; 16], i64::from(seed), seed))
         .collect();
     index.build(&first).unwrap();
@@ -344,7 +349,7 @@ fn cursor_pins_its_snapshot_across_a_rebuild() {
 #[test]
 fn cursor_rejects_a_different_room() {
     let engine = InMemoryStorage::new();
-    let index = TimelineIndex::open(&engine, "test");
+    let index = SeqIndex::open(&engine, "test");
     let entries = vec![entry([1u8; 16], 0, 1), entry([2u8; 16], 0, 2)];
     index.build(&entries).unwrap();
 
@@ -357,7 +362,7 @@ fn cursor_rejects_a_different_room() {
 #[test]
 fn empty_index_pages_nothing() {
     let engine = InMemoryStorage::new();
-    let index = TimelineIndex::open(&engine, "test");
+    let index = SeqIndex::open(&engine, "test");
     index.build(&[]).unwrap();
     let page = index.page(&[1u8; 16], None, true, 5).unwrap();
     assert!(
@@ -372,7 +377,7 @@ fn empty_index_pages_nothing() {
 fn append_inserts_into_existing_ranges_and_ignores_duplicates() {
     let room = [1u8; 16];
     let engine = InMemoryStorage::new();
-    let index = TimelineIndex::open(&engine, "append_ranges");
+    let index = SeqIndex::open(&engine, "append_ranges");
     let original: Vec<_> = (0..300u16)
         .map(|n| full(room, i64::from(n * 2), i64::from(n), (n % 251) as u8))
         .collect();
@@ -406,7 +411,7 @@ fn append_inserts_into_existing_ranges_and_ignores_duplicates() {
 fn append_to_empty_index_and_empty_append_are_well_defined() {
     let room = [3u8; 16];
     let engine = InMemoryStorage::new();
-    let index = TimelineIndex::open(&engine, "append_empty");
+    let index = SeqIndex::open(&engine, "append_empty");
     let entries = [full(room, 2, 4, 1), full(room, 1, 3, 2)];
 
     index.append_untransactional(&entries).unwrap();
@@ -434,7 +439,7 @@ fn append_routes_gap_entries_to_the_room_or_nonfull_leaf() {
     let left_max = full(room, 20, 20, 6);
     let right_min = full(room, 40, 40, 7);
     let same_room_gap = [
-        span(full(room, 0, 0, 8), left_max, TIMELINE_LEAF_CAP as u64),
+        span(full(room, 0, 0, 8), left_max, ORDERED_LEAF_CAP as u64),
         span(right_min, full(room, 60, 60, 9), 1),
     ];
     let gap_entry = full(room, 30, 30, 10);
@@ -478,7 +483,7 @@ fn interior_leaf_split_balances_mixed_room_entries() {
 #[test]
 fn buffered_head_snapshot_carries_flushes_pages_and_pins_cursors() {
     let engine = InMemoryStorage::new();
-    let index = TimelineIndex::open(&engine, "buffered_head_snapshot");
+    let index = SeqIndex::open(&engine, "buffered_head_snapshot");
     let scope = [0x31; 16];
     let mut entries = Vec::new();
     let mut pinned_cursor = None;
@@ -506,7 +511,7 @@ fn buffered_head_snapshot_carries_flushes_pages_and_pins_cursors() {
             assert_eq!(decoded.tiers.len(), 1);
             assert_eq!(decoded.tiers[0].entry_count, 9);
         }
-        if snapshot.bytes.starts_with(&TIMELINE_SNAPSHOT_MAGIC) {
+        if snapshot.bytes.starts_with(&ORDERED_SNAPSHOT_MAGIC) {
             let decoded = decode_snapshot::<ScopedSeqKey>(&snapshot.bytes, index.domain()).unwrap();
             assert_eq!(
                 decoded
@@ -516,7 +521,7 @@ fn buffered_head_snapshot_carries_flushes_pages_and_pins_cursors() {
                 count
             );
         } else {
-            assert!(snapshot.bytes.starts_with(&TIMELINE_ROOT_MAGIC));
+            assert!(snapshot.bytes.starts_with(&ORDERED_ROOT_MAGIC));
         }
 
         if position == 5 {
@@ -559,7 +564,7 @@ fn buffered_head_snapshot_carries_flushes_pages_and_pins_cursors() {
 #[test]
 fn buffered_head_mutations_remove_inline_tier_and_room_entries() {
     let engine = InMemoryStorage::new();
-    let index = TimelineIndex::open(&engine, "buffered_head_mutations");
+    let index = SeqIndex::open(&engine, "buffered_head_mutations");
     let room_a = [0x41; 16];
     let room_b = [0x42; 16];
     let entries: Vec<_> = (0_u8..40)
@@ -599,9 +604,9 @@ fn backfill_into_next_room_routes_across_a_directory_gap() {
     let room_a = [10; 16];
     let room_b = [11; 16];
     let engine = InMemoryStorage::new();
-    let index = TimelineIndex::open(&engine, "append_room_gap");
-    let event_count = TIMELINE_LEAF_CAP
-        .checked_mul(TIMELINE_DIRECTORY_FANOUT)
+    let index = SeqIndex::open(&engine, "append_room_gap");
+    let event_count = ORDERED_LEAF_CAP
+        .checked_mul(ORDERED_DIRECTORY_FANOUT)
         .expect("test event count fits usize");
     let mut entries: Vec<_> = (0..event_count)
         .map(|position| {
@@ -636,7 +641,7 @@ fn backfill_into_next_room_routes_across_a_directory_gap() {
 fn empty_stage_append_on_a_new_index_publishes_an_empty_root() {
     let db_path = test_root("stage_empty_new_index");
     let db = Database::open(db_path.clone()).unwrap();
-    let index = TimelineIndex::open(db.event_dag().as_ref(), "stage_empty_new_index");
+    let index = SeqIndex::open(db.event_dag().as_ref(), "stage_empty_new_index");
     let transaction = db.begin_transaction();
     let root_id = index
         .stage_append(&transaction, ShardType::EventDag, &[])
@@ -658,7 +663,7 @@ fn height_three_root_pages_through_two_directory_levels() {
     let room = [12; 16];
     let entry = full(room, 1, 1, 1);
     let engine = InMemoryStorage::new();
-    let index = TimelineIndex::open(&engine, "height_three_page");
+    let index = SeqIndex::open(&engine, "height_three_page");
     index.ensure_metadata().unwrap();
 
     let leaf_payload = encode_leaf(&[entry]).unwrap();
@@ -691,7 +696,7 @@ fn height_three_root_pages_through_two_directory_levels() {
     index.write_record(&root_id, root_payload).unwrap();
     index
         .write_record(
-            &TIMELINE_HEAD_ID,
+            &ORDERED_HEAD_ID,
             encode_head::<ScopedSeqKey>(&root_id, 1, index.domain()).unwrap(),
         )
         .unwrap();
@@ -705,7 +710,7 @@ fn transactional_append_uses_head_cas_and_can_be_retried() {
     let db_path = test_root("append_cas");
     let db = Database::open(db_path.clone()).unwrap();
     let room_id = [4u8; 16];
-    let index = TimelineIndex::open(db.event_dag().as_ref(), "append_cas");
+    let index = SeqIndex::open(db.event_dag().as_ref(), "append_cas");
     index.build(&[full(room_id, 1, 1, 1)]).unwrap();
 
     let first_entry = full(room_id, 2, 2, 2);
@@ -747,13 +752,13 @@ fn all_duplicates_append_does_not_bump_head_version() {
     let db_path = test_root("append_dupes");
     let db = Database::open(db_path.clone()).unwrap();
     let room_id = [7u8; 16];
-    let index = TimelineIndex::open(db.event_dag().as_ref(), "append_dupes");
+    let index = SeqIndex::open(db.event_dag().as_ref(), "append_dupes");
     let entry = full(room_id, 1, 1, 1);
     index.build(&[entry]).unwrap();
 
     let (_, before) = db
         .event_dag()
-        .get_with_record_versions(&index.collection_id(), &[TIMELINE_HEAD_ID])
+        .get_with_record_versions(&index.collection_id(), &[ORDERED_HEAD_ID])
         .unwrap();
 
     // Stage an append whose entries are all already present.
@@ -765,7 +770,7 @@ fn all_duplicates_append_does_not_bump_head_version() {
 
     let (_, after) = db
         .event_dag()
-        .get_with_record_versions(&index.collection_id(), &[TIMELINE_HEAD_ID])
+        .get_with_record_versions(&index.collection_id(), &[ORDERED_HEAD_ID])
         .unwrap();
     assert_eq!(
         before, after,
@@ -781,7 +786,7 @@ fn concurrent_first_appends_use_absent_head_cas() {
     let db_path = test_root("append_first_cas");
     let db = Database::open(db_path.clone()).unwrap();
     let room_id = [5u8; 16];
-    let index = TimelineIndex::open(db.event_dag().as_ref(), "append_first_cas");
+    let index = SeqIndex::open(db.event_dag().as_ref(), "append_first_cas");
     let first_entry = full(room_id, 1, 1, 1);
     let second_entry = full(room_id, 2, 2, 2);
     let first = db.begin_transaction();
@@ -818,7 +823,7 @@ fn empty_transactional_append_does_not_register_a_head_expectation() {
     let db_path = test_root("append_empty_transaction");
     let db = Database::open(db_path.clone()).unwrap();
     let room_id = [6u8; 16];
-    let index = TimelineIndex::open(db.event_dag().as_ref(), "append_empty_transaction");
+    let index = SeqIndex::open(db.event_dag().as_ref(), "append_empty_transaction");
     index.build(&[full(room_id, 1, 1, 1)]).unwrap();
 
     let empty = db.begin_transaction();
@@ -845,7 +850,7 @@ fn transactional_append_rejects_a_different_database_pool() {
     let second_path = test_root("append_wrong_pool_transaction");
     let first_db = Database::open(first_path.clone()).unwrap();
     let second_db = Database::open(second_path.clone()).unwrap();
-    let index = TimelineIndex::open(first_db.event_dag().as_ref(), "append_wrong_pool");
+    let index = SeqIndex::open(first_db.event_dag().as_ref(), "append_wrong_pool");
     let transaction = second_db.begin_transaction();
 
     assert!(matches!(
@@ -867,7 +872,7 @@ fn transactional_append_of_duplicates_does_not_rewrite_the_head() {
     let db = Database::open(db_path.clone()).unwrap();
     let room_id = [7u8; 16];
     let existing = full(room_id, 1, 1, 1);
-    let index = TimelineIndex::open(db.event_dag().as_ref(), "append_duplicate_transaction");
+    let index = SeqIndex::open(db.event_dag().as_ref(), "append_duplicate_transaction");
     let old_root = index.build(&[existing]).unwrap();
 
     let observer = db.begin_transaction();
@@ -875,14 +880,14 @@ fn transactional_append_of_duplicates_does_not_rewrite_the_head() {
         .get_with_record_versions(
             ShardType::EventDag,
             &index.collection_id(),
-            &[TIMELINE_HEAD_ID],
+            &[ORDERED_HEAD_ID],
         )
         .unwrap();
     observer
         .expect_record_version(
             ShardType::EventDag,
             index.collection_id(),
-            TIMELINE_HEAD_ID,
+            ORDERED_HEAD_ID,
             versions[0],
         )
         .unwrap();
@@ -909,7 +914,7 @@ fn duplicate_only_append_survives_a_head_moved_before_its_commit() {
     let room_id = [8u8; 16];
     let existing = full(room_id, 1, 1, 1);
     let moved = full(room_id, 2, 2, 2);
-    let index = TimelineIndex::open(db.event_dag().as_ref(), "append_duplicate_then_head_moves");
+    let index = SeqIndex::open(db.event_dag().as_ref(), "append_duplicate_then_head_moves");
     index.build(&[existing]).unwrap();
 
     let duplicate = db.begin_transaction();
@@ -930,10 +935,10 @@ fn duplicate_only_append_survives_a_head_moved_before_its_commit() {
     let _ = std::fs::remove_dir_all(&db_path);
 }
 
-fn full(room: [u8; 16], topological: i64, stream: i64, seed: u8) -> TimelineEntry {
+fn full(room: [u8; 16], topological: i64, stream: i64, seed: u8) -> ScopedSeqKey {
     let mut node_id = [0u8; 16];
     node_id[0] = seed;
-    TimelineEntry::new(room, topological, stream, node_id, [seed; 32])
+    ScopedSeqKey::new(room, topological, stream, node_id, [seed; 32])
 }
 
 #[test]
@@ -950,7 +955,7 @@ fn order_is_topological_then_stream_then_node() {
         full(room, 2, i64::MIN, 5),
     ];
     let engine = InMemoryStorage::new();
-    let index = TimelineIndex::open(&engine, "test");
+    let index = SeqIndex::open(&engine, "test");
     index.build(&entries).unwrap();
 
     let keys: Vec<(i64, i64, u8)> = collect(&index, &room, true, 2)
@@ -983,13 +988,16 @@ fn wire_encoding_is_byte_comparable_and_roundtrips() {
     for value in values {
         assert_eq!(decode_position(encode_position(value)), value);
     }
-    let cursor = TimelineCursor::new(
+    let cursor = OrderedCursor::<ScopedSeqKey>::new(
         [9u8; 16],
         full(room, -3, i64::MIN, 6),
         DomainTag::new([0xD0; 16]),
     )
     .unwrap();
-    assert_eq!(TimelineCursor::decode(&cursor.encode()), Some(cursor));
+    assert_eq!(
+        OrderedCursor::<ScopedSeqKey>::decode(&cursor.encode()),
+        Some(cursor)
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1341,7 +1349,7 @@ fn staged_mutate_stages_only_one_final_cow_path() {
 #[test]
 fn prefix_purge_drops_one_room_without_reading_its_subtrees() {
     let engine = InMemoryStorage::new();
-    let index = TimelineIndex::open(&engine, "purge_rooms");
+    let index = SeqIndex::open(&engine, "purge_rooms");
     let room_a = [0xAA; 16];
     let room_b = [0xBB; 16];
     let mut entries = Vec::new();
@@ -1367,8 +1375,8 @@ fn prefix_purge_drops_one_room_without_reading_its_subtrees() {
 
 fn append_one<S: StorageEngine + ?Sized>(
     db: &Database,
-    index: &OrderedIndex<'_, S, TimelineEntry>,
-    value: TimelineEntry,
+    index: &OrderedIndex<'_, S, ScopedSeqKey>,
+    value: ScopedSeqKey,
 ) {
     let transaction = db.begin_transaction();
     index
@@ -1379,7 +1387,7 @@ fn append_one<S: StorageEngine + ?Sized>(
 
 fn head_bytes<S: StorageEngine + ?Sized>(
     db: &Database,
-    index: &OrderedIndex<'_, S, TimelineEntry>,
+    index: &OrderedIndex<'_, S, ScopedSeqKey>,
 ) -> Vec<u8> {
     let (head_id, _) = index.head().unwrap().unwrap();
     db.event_dag()
@@ -1393,7 +1401,7 @@ fn head_bytes<S: StorageEngine + ?Sized>(
 #[test]
 fn head_snapshot_buffers_single_appends_and_pages_across_a_flush() {
     let engine = InMemoryStorage::new();
-    let index = TimelineIndex::open(&engine, "head_snapshot_flow");
+    let index = SeqIndex::open(&engine, "head_snapshot_flow");
     let room = [9u8; 16];
 
     let mut expected = Vec::new();
@@ -1409,8 +1417,8 @@ fn head_snapshot_buffers_single_appends_and_pages_across_a_flush() {
             .unwrap()
             .unwrap()
             .bytes;
-        saw_snapshot |= bytes.starts_with(&TIMELINE_SNAPSHOT_MAGIC);
-        saw_flush |= bytes.starts_with(&TIMELINE_ROOT_MAGIC);
+        saw_snapshot |= bytes.starts_with(&ORDERED_SNAPSHOT_MAGIC);
+        saw_flush |= bytes.starts_with(&ORDERED_ROOT_MAGIC);
     }
     assert!(saw_snapshot, "single appends should buffer in TMLS");
     assert!(saw_flush, "the buffer should flush to TMLR");
@@ -1432,7 +1440,7 @@ fn head_snapshot_cursor_survives_a_flush_and_pinned_gc() {
     let db_path = test_root("head_snapshot_cursor");
     let db = Database::open(db_path.clone()).unwrap();
     let engine = db.event_dag();
-    let index = TimelineIndex::open(engine.as_ref(), "head_snapshot_cursor");
+    let index = SeqIndex::open(engine.as_ref(), "head_snapshot_cursor");
     let room = [5u8; 16];
 
     let mut expected = Vec::new();
@@ -1490,7 +1498,7 @@ fn head_snapshot_cursor_survives_a_flush_and_pinned_gc() {
 fn buffered_head_snapshot_remove_and_purge_report_exact_counts() {
     let db_path = test_root("head_snapshot_mutate");
     let db = Database::open(db_path.clone()).unwrap();
-    let index = TimelineIndex::open(db.event_dag().as_ref(), "head_snapshot_mutate");
+    let index = SeqIndex::open(db.event_dag().as_ref(), "head_snapshot_mutate");
     let room = [3u8; 16];
 
     let entries: Vec<_> = (0..5_i64)
@@ -1499,7 +1507,7 @@ fn buffered_head_snapshot_remove_and_purge_report_exact_counts() {
     for value in &entries {
         append_one(&db, &index, *value);
     }
-    assert!(head_bytes(&db, &index).starts_with(&TIMELINE_SNAPSHOT_MAGIC));
+    assert!(head_bytes(&db, &index).starts_with(&ORDERED_SNAPSHOT_MAGIC));
 
     let transaction = db.begin_transaction();
     let (_, removed) = index
@@ -1507,7 +1515,7 @@ fn buffered_head_snapshot_remove_and_purge_report_exact_counts() {
         .unwrap();
     transaction.commit().unwrap();
     assert_eq!(removed, 2);
-    assert!(head_bytes(&db, &index).starts_with(&TIMELINE_ROOT_MAGIC));
+    assert!(head_bytes(&db, &index).starts_with(&ORDERED_ROOT_MAGIC));
     assert_eq!(
         collect(&index, &room, true, 10),
         vec![entries[0], entries[2], entries[4]]
@@ -1534,7 +1542,7 @@ fn buffered_head_snapshot_remove_and_purge_report_exact_counts() {
 fn duplicate_appends_across_head_and_base_do_not_publish() {
     let db_path = test_root("head_snapshot_duplicates");
     let db = Database::open(db_path.clone()).unwrap();
-    let index = TimelineIndex::open(db.event_dag().as_ref(), "head_snapshot_duplicates");
+    let index = SeqIndex::open(db.event_dag().as_ref(), "head_snapshot_duplicates");
     let room = [4u8; 16];
 
     let base = entry(room, 1, 1);
@@ -1546,7 +1554,7 @@ fn duplicate_appends_across_head_and_base_do_not_publish() {
     let second = entry(room, 2, 2);
     append_one(&db, &index, second);
     let buffered = head_bytes(&db, &index);
-    assert!(buffered.starts_with(&TIMELINE_SNAPSHOT_MAGIC));
+    assert!(buffered.starts_with(&ORDERED_SNAPSHOT_MAGIC));
     assert_eq!(index.head().unwrap().unwrap().1, 2);
 
     append_one(&db, &index, second);
