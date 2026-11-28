@@ -2699,10 +2699,6 @@ impl PackfileStorage {
         (BookkeepingSource::Sidecar, counts)
     }
 
-    /// Whether every pending redo set names a record that is really at its
-    /// locator: the frame there belongs to the same collection and carries the
-    /// same full hash. Any mismatch, or a frame that cannot be read, fails the
-    /// whole log closed to the caller's rescan.
     fn generation(&self, collection_id: &[u8; 16]) -> Option<arc_swap::Guard<Arc<RoomGeneration>>> {
         self.collections_read()
             .get(collection_id)

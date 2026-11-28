@@ -19,6 +19,10 @@ use super::{
 };
 
 impl PackfileStorage {
+    /// Whether every pending redo set names a record that is really at its
+    /// locator: the frame there belongs to the same collection and carries the
+    /// same full hash. Any mismatch, or a frame that cannot be read, fails the
+    /// whole log closed to the caller's rescan.
     fn redo_locators_verified(
         shards: &ShardPool,
         sets: &HashMap<[u8; 16], Vec<RedoRecord>>,
