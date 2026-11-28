@@ -27,7 +27,14 @@ mod txn_stage;
 mod writer;
 #[cfg(test)]
 pub(crate) use segment::cut_segment_image_to_durable_mark;
-use segment::*;
+#[cfg(test)]
+use segment::{decode_mark_slot, decode_mutations};
+use segment::{
+    encode_group, encode_group_header, encode_group_trailer, encode_mark_slot, encode_mutation,
+    file_header_bytes, invalid_data, newest_mark, read_durable_len_from_header, read_file_header,
+    read_range_into, scan_bytes, scan_groups_from, sync_parent_dir, validate_file_header,
+    write_file_header, MarkSlot,
+};
 
 const FILE_MAGIC: &[u8; 8] = b"MTXWAL01";
 const GROUP_MAGIC: &[u8; 4] = b"MWG1";
@@ -1646,6 +1653,14 @@ struct ChangesWindow {
     directory_trusted: bool,
 }
 
+/// Exclusive writer claim on a database root's shared WAL.
+///
+/// One shared segment serves every pool, so a single writer process must own
+/// it. This takes the same crash-safe `{pid, starttime}` lock the per-pool
+/// writer lock uses, at `<db_root>/.mtxdb.wal.lock`, and releases it on drop
+/// (see `ShardPool::acquire_writer_lock` for the staleness contract). The
+/// holder opens the segment with [`Journal::open_shared`], builds one
+/// [`JournalCoordinator`], and attaches each pool with
 /// `PackfileStorage::enable_shared_journal`.
 pub struct SharedWalLock {
     _lock: crate::shard::WriterLock,

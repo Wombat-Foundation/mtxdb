@@ -3,7 +3,19 @@
 //! The `Journal` struct, its tuning types, and the coordinator state machine
 //! stay in the parent module.
 
-use super::*;
+use super::{
+    boundary_through, emergency_len_for_cap, encode_group, encode_group_header,
+    encode_group_trailer, encode_mark_slot, encode_mutation, file_header_bytes, fs, invalid_data,
+    io, marks_from_scan, newest_mark, pool_bit, read_durable_len_from_header, read_file_header,
+    read_range_into, scan_bytes, scan_groups_from, sync_parent_dir, validate_file_header,
+    write_file_header, CommitReceipt, File, GroupDirectoryStats, GroupMark, HashMap, Hasher,
+    Journal, MarkSlot, Mutation, OpenOptions, Path, Read, Reclaim, ReclaimedHistory, Scan, Seek,
+    SeekFrom, ShardType, SharedBoundary, Write, FILE_HEADER_LEN, MARK_SLOT_LEN, MARK_SLOT_OFFSETS,
+    MAX_GROUP_LEN, MAX_SEGMENT_LEN, POOL_SLOTS, UNPROFITABLE_REWRITE_MIN_COPY,
+    UNPROFITABLE_REWRITE_RATIO,
+};
+#[cfg(test)]
+use super::{Arc, RewritePhase, RewritePhaseGuard};
 
 impl Journal {
     /// Scan an existing journal without opening it for writing or repairing a
@@ -767,7 +779,10 @@ impl Journal {
     /// which every pool with a frame has covered the group. The directory being
     /// stale is reported apart from nothing being covered, so the caller can
     /// scan the file in that case.
-    pub(super) fn shared_reclaim_boundary(&self, covered: &HashMap<ShardType, u64>) -> SharedBoundary {
+    pub(super) fn shared_reclaim_boundary(
+        &self,
+        covered: &HashMap<ShardType, u64>,
+    ) -> SharedBoundary {
         if !self.directory_matches_file() {
             return SharedBoundary::Untrusted;
         }
@@ -906,7 +921,7 @@ impl Journal {
     /// Reclaim by reading and decoding the whole segment. Used when the group
     /// directory cannot be trusted, and it rebuilds the directory from what it
     /// finds.
-    fn reclaim_through_scan(&mut self, covered_lsn: u64) -> io::Result<Reclaim> {
+    pub(super) fn reclaim_through_scan(&mut self, covered_lsn: u64) -> io::Result<Reclaim> {
         let scan_started = std::time::Instant::now();
         let bytes = fs::read(&self.path)?;
         let (base_sequence, base_lsn) = validate_file_header(&bytes)?;
@@ -1054,14 +1069,3 @@ impl Journal {
         Ok(())
     }
 }
-
-/// Append `len` bytes of the file at `path`, starting at `start`, to `out`.
-
-/// Exclusive writer claim on a database root's shared WAL.
-///
-/// One shared segment serves every pool, so a single writer process must own
-/// it. This takes the same crash-safe `{pid, starttime}` lock the per-pool
-/// writer lock uses, at `<db_root>/.mtxdb.wal.lock`, and releases it on drop
-/// (see `ShardPool::acquire_writer_lock` for the staleness contract). The
-/// holder opens the segment with [`Journal::open_shared`], builds one
-/// [`JournalCoordinator`], and attaches each pool with

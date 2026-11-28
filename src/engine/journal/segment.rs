@@ -3,8 +3,20 @@
 //! These are the pure codecs over the journal byte layout. The [`Journal`] and
 //! [`JournalCoordinator`] state machines live in the parent module.
 
-use super::*;
+#[cfg(test)]
+use super::{fs, OpenOptions};
+use super::{
+    io, pool_from_tag, pool_tag, CommittedGroup, File, Hasher, JournalEntry, Mutation, Path, Read,
+    ReclaimedHistory, Scan, Seek, SeekFrom, ShardType, Write, CONSUMED_TAIL_LEN, FH_BASE_LSN,
+    FH_BASE_SEQUENCE, FH_MAGIC, FH_MARKS_AT, FH_SLOTS, FH_VERSION, FILE_HEADER_LEN, FILE_MAGIC,
+    FRAME_FIXED_LEN, FRAME_TRAILER_LEN, GH_CRC, GH_CRC_COVERED, GH_FIRST_LSN, GH_HEADER_LEN,
+    GH_LAST_LSN, GH_MAGIC, GH_PAYLOAD_LEN, GH_RECORD_COUNT, GH_SEQUENCE, GROUP_COMMIT_MAGIC,
+    GROUP_HEADER_LEN, GROUP_MAGIC, GROUP_TRAILER_LEN, GT_CRC, GT_MAGIC, GT_SEQUENCE,
+    JOURNAL_VERSION, MARK_SLOT_LEN, MARK_SLOT_OFFSETS, MAX_GROUP_LEN, MF_COLLECTION, MF_FLAGS,
+    MF_KIND, MF_LSN, MF_NODE, MF_PAYLOAD_LEN, MF_POOL, MIN_FRAME_LEN, POOL_SLOTS,
+};
 
+/// Append `len` bytes of the file at `path`, starting at `start`, to `out`.
 pub(super) fn read_range_into(
     path: &Path,
     start: u64,

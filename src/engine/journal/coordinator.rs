@@ -3,7 +3,23 @@
 //! The `JournalCoordinator` struct and its counters live in the parent module;
 //! this file holds its inherent impl block.
 
-use super::*;
+use super::{
+    boundary_through, changes_since_force_untrusted, emergency_len_for_cap, io, marks_from_scan,
+    max_reclaim_trigger_for_cap, note_changes_since_full_scan, pool_extents, Arc, AtomicBool,
+    AtomicU64, BackgroundCommitter, BackgroundFailure, BackgroundState, ChangesWindow,
+    CollectionExpectation, CommitReceipt, CommittedGroup, Condvar, CoverageState, DurabilityStats,
+    DurabilityToken, DurableWaitTotals, Duration, GroupCommitConfig, GroupDirectoryStats, HashMap,
+    Journal, JournalChangesPage, JournalCoordinator, JournalCursor, JournalReplayLease,
+    JournalSyncTimings, LeasePin, Mutation, Mutex, MutexGuard, Ordering, Path, PathBuf,
+    PendingPromotion, PreSyncHook, PublishSignal, Reclaim, ReclaimStall, RecordExpectation,
+    RecordVersions, ReplayLeaseRegistry, ReplayPageStats, ReplayPageStatsAtomic, Scan,
+    SeededVersions, SegmentPosition, ShardType, SharedBoundary, StaleVersion, SyncCapture,
+    SyncInFlightGuard, Weak, Write, CURSOR_EXPIRED_PREFIX, DURABILITY_WAIT_POLL,
+    MAX_RECLAIM_TRIGGER_LEN, RECLAIM_TRIGGER_LEN, REMEDIATING, SEGMENT_RECLAIMED_MESSAGE,
+    SLOW_FSYNC_WARN,
+};
+#[cfg(test)]
+use super::{take_changes_since_before_read_hook, RewritePhase};
 
 impl JournalCoordinator {
     /// Seed logical collection versions and per-record write LSNs from the
@@ -2043,7 +2059,7 @@ impl JournalCoordinator {
         self.background_coalesced.load(Ordering::Relaxed)
     }
 
-    fn background_failure_detail(&self) -> Option<BackgroundFailure> {
+    pub(super) fn background_failure_detail(&self) -> Option<BackgroundFailure> {
         self.background_failure.lock().clone()
     }
 
@@ -2076,13 +2092,16 @@ impl JournalCoordinator {
     /// can advance the epoch between the load and the CAS; re-reading the epoch
     /// after a successful claim ensures that newer commit also gets a wake
     /// instead of being suppressed by a claim that was valid a moment earlier.
-    fn claim_threshold_wake(&self) -> bool {
+    pub(super) fn claim_threshold_wake(&self) -> bool {
         self.claim_threshold_wake_with(|| {})
     }
 
     /// [`Self::claim_threshold_wake`] with a hook run between a successful claim
     /// and the epoch recheck, so tests can force a commit into that window.
-    fn claim_threshold_wake_with(&self, mut between_claim_and_recheck: impl FnMut()) -> bool {
+    pub(super) fn claim_threshold_wake_with(
+        &self,
+        mut between_claim_and_recheck: impl FnMut(),
+    ) -> bool {
         loop {
             let notified = self.threshold_notified_epoch.load(Ordering::Acquire);
             let epoch = self.commit_epoch.load(Ordering::Acquire);
@@ -2339,7 +2358,7 @@ impl JournalCoordinator {
 
     /// Mark the committer slot stopped, publish any terminal failure, and wake
     /// waiters. Called by the worker itself as it exits.
-    fn finish_background(&self, failure: Option<BackgroundFailure>) {
+    pub(super) fn finish_background(&self, failure: Option<BackgroundFailure>) {
         // Transition, publish the failure, and clear the wake threshold under a
         // single `background` lock. A concurrent `start_background_committer`
         // (which holds that lock to clear `background_failure` and set its own
@@ -2475,4 +2494,3 @@ impl JournalCoordinator {
         Ok(reclaim)
     }
 }
-

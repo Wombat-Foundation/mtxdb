@@ -4,7 +4,12 @@
 //! commit, then hands them to the shared-WAL publisher. The state machine and
 //! its supporting types are declared in the parent module.
 
-use super::*;
+use super::{
+    io, pool_index, stage_too_large_with_limit, CollectionExpectation, CommitReceipt, HashSet,
+    JournalCoordinator, Mutation, Mutex, Ordering, RecordExpectation, ShardType, StageIndex,
+    StagedLookup, TxnStage, TxnStageData, TxnStageState, MAX_TXN_STAGE_BYTES,
+    TXN_STAGE_PUT_OVERHEAD_BYTES,
+};
 
 impl Default for TxnStage {
     fn default() -> Self {

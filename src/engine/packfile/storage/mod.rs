@@ -3112,7 +3112,6 @@ impl PackfileStorage {
         ShardPool::record_disk_len_at(shard, offset)
     }
 
-
     fn collection_generation_floor(&self, collection_id: &[u8; 16]) -> Option<u32> {
         self.collection_generation_fences
             .lock()

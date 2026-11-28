@@ -3,8 +3,15 @@
 //! These are the multi-shard read paths used by point lookups, collection
 //! iteration, and the shard-compaction preflight.
 
-use super::*;
+#[cfg(test)]
+use super::TestScannedRecord;
+use super::{
+    packfile, Arc, CollectionGeneration, CollectionScan, CollectionScanPair, HashMap, HashSet,
+    JournalCoordinator, JournalCursor, JournalReplayLease, MutexGuard, NodeData, NodeId, Ordering,
+    PackfileStorage, PreparedCollectionScan, ScanWork, ScannedRepackShard, Shard, StorageError,
+};
 
+impl PackfileStorage {
     /// Stream every live record of one collection from a single consistent
     /// snapshot.
     ///
@@ -567,3 +574,4 @@ use super::*;
         }
         Ok(scanned)
     }
+}
